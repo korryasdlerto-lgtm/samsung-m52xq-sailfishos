@@ -10,6 +10,10 @@ First release. По-русски: [CHANGES-v1-RU.md](CHANGES-v1-RU.md).
 - Public installer: the proprietary firmware is taken from the phone's partitions; the size of the image is checked before
   anything is written; no personal data in the image; the user and the start wizard are created at the first boot.
 - Messages do not switch the display on.
+- Browser: it no longer hangs while a page is scrolled ("not responding", lost swipes, black full-screen video). Its main thread
+  showed every frame itself and Mesa made it wait for the display; now it does not (`vblank_mode=0`). The Mesa shader cache of the
+  browser is kept on disk.
+- Sound: the driver retry after a lost DSP start race now also finds the pin controller under its current name.
 
 ## Phone
 

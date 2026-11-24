@@ -5,7 +5,7 @@ Mesa freedreno. Tested on one SM-M526BR. По-русски: [MANUAL-RU.md](MANUA
 
 ## What works and what does not
 
-Works: display and GPU, touch, volume keys, auto-rotation and auto-brightness; Wi-Fi; Bluetooth; calls, SMS and mobile data
+Works: display and GPU, browser (YouTube up to 4K), touch, volume keys, auto-rotation and auto-brightness; Wi-Fi; Bluetooth; calls, SMS and mobile data
 on two SIM cards (both active); ringtone, earpiece and loudspeaker; screen off at the ear; sound; flashlight; light, proximity
 and acceleration sensors; camera (four lenses, 64 MP photos, flash); sleep with Wi-Fi wake-up; battery and charging; SIM
 manager; reboot menu; screenshot with both volume keys.

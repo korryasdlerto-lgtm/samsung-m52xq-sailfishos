@@ -16,5 +16,6 @@ under `/root/src` and the output under `/root/out`.
   v4l c98eb6d; it contains the 15 camera patches of moWerk's sailfishos-pro1x-mainline and ours. `build-qtmultimedia.sh`
   builds everything, `build-qgsttools.sh` and `build-camerabin.sh` only those parts.
 - `camera/rawphoto/`: `m52xq-rawphoto` (libcamera, GLES); `camera/jolla-camera/`: patches of the Jolla camera QML.
+- `browser/`: `sailjail-browser.sh` adds the browser settings to the sandbox profile (`vblank_mode=0`, shader cache on disk).
 - `tools/`: small C programs (GLib): `gcc -O2 -o m52xq-flashlight m52xq-flashlight.c $(pkg-config --cflags --libs gio-2.0)`;
   `m52xq-bt-awake` needs `gio-2.0 gio-unix-2.0`; `m52xq-gps-sv` has no dependencies.

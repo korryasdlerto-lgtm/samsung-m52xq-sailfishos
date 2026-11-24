@@ -41,6 +41,7 @@ GPU-accelerated Lipstick work. GPS does not find a position at the moment (see t
 | Camera | works | four cameras with a switch (0.5 ultra wide, 1.0 main, M macro, front); photos of 64 MP (main) and 32 MP (front), flash, autofocus, zoom up to 8x |
 | Sleep | works | s2idle with Wi-Fi wake-up; in two tests of 7–10 minutes the phone slept 90–92 % of the time; the night has not been measured yet |
 | Notifications | works | messages do not switch the display on |
+| Browser | works | Sailfish Browser (Gecko 115) with `vblank_mode=0`; YouTube in 4K plays (software decoding) |
 | Battery, charging | works | SM5714 fuel gauge and charger |
 | GPS | **no position** | no position at the moment; it worked with an earlier build of this port. The cause is not known; see the known issues |
 | Video codecs (Venus) | partial | modules load; hardware decoding and recording in the Camera are not tested |
@@ -60,7 +61,7 @@ GPU-accelerated Lipstick work. GPS does not find a position at the moment (see t
 Requirements: unlocked bootloader, TWRP for m52xq, a microSD card with the zip, backups of EFS, persist, modem, boot,
 vendor_boot and vbmeta. If you are not comfortable restoring a Samsung phone with Odin, do not install this.
 
-- Flashable zip: `sailfishos-5.2-m52xq-mainline-v1.zip` (620 MB), md5 `af0e8264a4ae7f3d0f6ad627e7004658` (not published yet).
+- Flashable zip: `sailfishos-5.2-m52xq-mainline-v1.zip` (620 MB), md5 `67ceb2bc8848733e94baaa7ba8cdc8b6` (not published yet).
 
 TWRP steps:
 
@@ -103,6 +104,7 @@ Back to Android: flash LineageOS or UN1CA in TWRP, or the stock firmware with Od
 | `camera/qtmultimedia` | QtMultimedia of mlehtima (v4l branch) with the patches of the pro1x port (moWerk) and ours as one patch: own autofocus and zoom for libcamerasrc, 64 MP photos through a helper, front/back detection of libcamera 0.8, flash |
 | `camera/rawphoto` | `m52xq-rawphoto`: full-resolution raw capture and development on the GPU |
 | `camera/jolla-camera` | small patches of the Jolla camera QML (camera list and order, volume keys, sandbox permission for the flash) |
+| `browser` | sandbox profile of the Sailfish Browser: `vblank_mode=0` and the Mesa shader cache on disk |
 | `tools/m52xq-flashlight`, `tools/m52xq-bt-awake` | flashlight/flash service (D-Bus), Bluetooth in the sleep |
 | `tools/m52xq-gps-sv` | reads the number and strength of the visible satellites from the modem (no position), for debugging |
 

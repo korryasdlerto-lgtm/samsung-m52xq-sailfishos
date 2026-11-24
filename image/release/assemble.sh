@@ -2,7 +2,7 @@
 # Device layer of the release on top of a clean Sailfish root: files, ofono, camera, rpms. Run as root. Usage: assemble.sh <mounted p2>
 set -e
 # Inputs (next to this script): rootfs-files/ (device layer), hw-ofono/ofonod, hw-camera/, hw-venus/, hw-sound/, rpms-camera/,
-# and the scripts of build/camera/jolla-camera and messages-no-display-on.sh
+# and the scripts of build/camera/jolla-camera, build/browser and messages-no-display-on.sh
 B=$(cd "$(dirname "$0")" && pwd); R="$1"; cd "$B"
 [ -f "$R/etc/passwd" ] && [ -d "$R/usr/lib64/qt5" ]
 echo "== rootfs-files (one by one, root:root)"
@@ -25,6 +25,7 @@ Q="$R/usr/lib64/qt5/qml/com/jolla/camera/capture/CaptureView.qml"
 for p in captureview-volume-keys captureview-cameras captureview-camera-order; do python3 "$B/jolla-camera/$p.py" "$Q"; done
 md5sum "$Q"
 sh "$B/jolla-camera/sailjail-camera-flash.sh" "$R"
+sh "$B/browser/sailjail-browser.sh" "$R"
 sh "$B/messages-no-display-on.sh" "$R"
 echo "== rpms-camera"
 mkdir -p "$R/tmp/rpms"; cp "$B"/rpms-camera/*.rpm "$R/tmp/rpms/"

@@ -4,7 +4,9 @@
 # (3)", probe -110, and a driver never tries again. Then rx/tx macro, SoundWire and the card wait forever ("no
 # soundcards"). Which drivers lose it varies: va_macro (3370000.codec) on one boot, also the LPASS LPI pin controller
 # (33c0000.lpass-lpi-pinctrl) on another (25.10, v3). Retry the probe of the ones without a driver until the card is there.
-DEVS="33c0000.lpass-lpi-pinctrl 3370000.codec"
+# The pin controller is 33c0000.pinctrl with the upstream device tree and 33c0000.lpass-lpi-pinctrl with the older one: found by
+# its address (a clean installation, 2026-11-24: the old name only, no sound card).
+DEVS="$(cd /sys/bus/platform/devices && ls -d 33c0000.*pinctrl 2>/dev/null) 3370000.codec"
 for i in $(seq 40); do
 	# r2 (2026-11-17): the built-in card by name (a USB headset plugged at boot is also a sound card)
 	grep -q 'SM-M526B-WCD938X' /proc/asound/cards 2>/dev/null && exit 0

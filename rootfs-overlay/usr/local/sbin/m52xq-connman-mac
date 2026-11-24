@@ -1,0 +1,22 @@
+#!/bin/sh
+# m52xq (Sailfish): connman takes the address of wlan0 when the interface appears (a random one, ath11k has none of its own) and
+# keys its saved networks by it, while m52xq-wifi-mac (udev) sets this phone's EFS address a moment later. So after every
+# reboot the saved network was unknown. Restart connman once per boot, after the EFS address is set (the unit has
+# RemainAfterExit; started by udev when wlan0 is added).
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+f=/etc/m52xq/wifi_mac
+[ -r $f ] || exit 0
+want=$(tr -d ' \n' < $f | tr 'A-F' 'a-f')
+i=0
+while [ $i -lt 20 ]; do
+	cur=$(cat /sys/class/net/wlan0/address 2>/dev/null)
+	[ "$cur" = "$want" ] && break
+	sleep 1
+	i=$((i + 1))
+done
+[ "$cur" = "$want" ] || { echo "wlan0 does not have the EFS address, connman left alone"; exit 0; }
+# the driver's own address is the EFS one already: nothing to do
+perm=$(ip link show wlan0 | sed -n 's/.*permaddr \([0-9a-f:]*\).*/\1/p')
+[ -n "$perm" ] || { echo "no other address, connman left alone"; exit 0; }
+systemctl try-restart connman.service && echo "connman restarted: it now sees the EFS address of wlan0"
+exit 0

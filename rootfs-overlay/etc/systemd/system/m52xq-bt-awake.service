@@ -1,0 +1,11 @@
+[Unit]
+Description=M52XQ: stay awake while a Bluetooth audio device is connected
+After=dbus.service bluetooth.service
+
+[Service]
+ExecStart=/usr/libexec/m52xq/m52xq-bt-awake
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

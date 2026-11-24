@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SIM cards manager
+Name[ru]=Менеджер SIM-карт
+Comment=Both SIM cards or only one, mobile data on/off, SIM cards off/on
+Comment[ru]=Обе SIM-карты или одна, мобильные данные вкл/выкл, SIM-карты вкл/выкл
+Icon=icon-m-sim-1
+Exec=/usr/bin/env QML_XHR_ALLOW_FILE_WRITE=1 QML_XHR_ALLOW_FILE_READ=1 /usr/bin/sailfish-qml m52xq-sim-manager
+X-Nemo-Single-Instance=no
+
+[X-Sailjail]
+Sandboxing=Disabled

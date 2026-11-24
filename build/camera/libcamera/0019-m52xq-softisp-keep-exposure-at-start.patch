@@ -1,0 +1,85 @@
+From: Asdlerto Korry <korryasdlerto@gmail.com>
+Subject: [PATCH] m52xq: softisp: no default exposure at the start of the stream, shorter AGC hold
+
+---
+--- c/src/ipa/softisp/softisp.cpp	2026-11-24 02:20:25.325552911 +0200
++++ d/src/ipa/softisp/softisp.cpp	2026-11-24 02:20:25.357553602 +0200
+@@ -81,6 +81,14 @@
+ 	DebayerParams *params_;
+ 	SwIspStats *stats_;
+ 
++	/*
++	 * m52xq: frames prepared before the first statistics carry the default
++	 * exposure and gain of the sensor; sending those made the picture dark
++	 * for a moment at every start of the stream.
++	 */
++	bool statsSeen_ = false;
++	int64_t lastDefaultFrame_ = -1;
++
+ 	/* Local parameter storage */
+ 	struct IPAContext context_;
+ };
+@@ -232,6 +240,9 @@
+ 
+ int IPASoftIsp::start()
+ {
++	statsSeen_ = false;
++	lastDefaultFrame_ = -1;
++
+ 	return 0;
+ }
+ 
+@@ -255,6 +266,8 @@
+ 	IPAFrameContext &frameContext = context_.frameContexts.get(frame);
+ 	for (const auto &algo : algorithms())
+ 		algo->prepare(context_, frame, frameContext, params_);
++	if (!statsSeen_)
++		lastDefaultFrame_ = frame;
+ 	params_->combinedMatrix = context_.activeState.combinedMatrix;
+ 
+ 	paramsComputed.emit(frame);
+@@ -272,11 +285,21 @@
+ 	ControlList metadata(controls::controls);
+ 	for (const auto &algo : algorithms())
+ 		algo->process(context_, frame, frameContext, stats_, metadata);
++	if (stats_->valid)
++		statsSeen_ = true;
+ 	metadataReady.emit(frame, metadata);
+ 
+ 	ControlList ctrls(context_.sensorControls);
+-	agc::prepareControls(ctrls, context_.camHelper.get(),
+-			     frameContext.agc.exposure, frameContext.agc.gain);
++	uint32_t exposure = frameContext.agc.exposure;
++	double gain = frameContext.agc.gain;
++	if (static_cast<int64_t>(frame) <= lastDefaultFrame_ && frameContext.sensor.exposure) {
++		/* Keep what the sensor has until the first result is available. */
++		if (frameContext.agc.autoExposureEnabled)
++			exposure = frameContext.sensor.exposure;
++		if (frameContext.agc.autoGainEnabled)
++			gain = frameContext.sensor.gain;
++	}
++	agc::prepareControls(ctrls, context_.camHelper.get(), exposure, gain);
+ 	setSensorControls.emit(ctrls);
+ }
+ 
+--- c/src/ipa/libipa/agc_msv.cpp	2026-11-24 02:20:25.325552911 +0200
++++ d/src/ipa/libipa/agc_msv.cpp	2026-11-24 02:20:25.357553602 +0200
+@@ -115,14 +115,15 @@
+  *
+  * The statistics are linear and MSV is about 0.5 + 5 * mean, so the factor
+  * needed is (kExposureOptimal - 0.5) / (MSV - 0.5), slightly damped. Big
+- * corrections are made at once, small ones spread over kExpRampFrames.
++ * corrections are made at once, small ones spread over kExpRampFrames. The
++ * frames are those with statistics: the software ISP has them in one of four.
+  */
+ static constexpr float kExpDamping = 0.85;
+ static constexpr float kExpFactorMin = 0.25;
+ static constexpr float kExpFactorMax = 2.5;
+ static constexpr float kExpRampError = 0.6;
+-static constexpr unsigned int kExpRampFrames = 4;
+-static constexpr unsigned int kExpHoldFrames = 8;
++static constexpr unsigned int kExpRampFrames = 3;
++static constexpr unsigned int kExpHoldFrames = 2;
+ 
+ std::optional<float> calculateMSV(const Histogram &histogram)
+ {

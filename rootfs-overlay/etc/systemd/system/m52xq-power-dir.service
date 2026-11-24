@@ -1,0 +1,10 @@
+[Unit]
+Description=M52XQ: /run/m52xq-power for the reboot menu requests
+DefaultDependencies=no
+After=local-fs.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'mkdir -p /run/m52xq-power && chown root:users /run/m52xq-power && chmod 0770 /run/m52xq-power'
+[Install]
+WantedBy=multi-user.target

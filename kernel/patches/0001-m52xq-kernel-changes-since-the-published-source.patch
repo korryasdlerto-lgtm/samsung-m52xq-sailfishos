@@ -1,0 +1,1426 @@
+diff -ruN a/drivers/dma/qcom/gpi.c b/drivers/dma/qcom/gpi.c
+--- a/drivers/dma/qcom/gpi.c	2026-11-24 13:24:04.191921671 +0200
++++ b/drivers/dma/qcom/gpi.c	2026-11-24 13:24:04.199921320 +0200
+@@ -529,6 +529,8 @@
+ 	struct gchan *gchan;
+ 	struct gpi_tre tre[MAX_TRE];
+ 	u32 num_tre;
++	/* M52XQ v261: this TX descriptor ends with an UNLOCK TRE (shared SE): its EOT is not the end, its EOB is */
++	bool m52xq_unlock;
+ };
+ 
+ static const u32 GPII_CHAN_DIR[MAX_CHANNELS_PER_GPII] = {
+@@ -923,7 +925,6 @@
+ 	struct gpi_desc *gpi_desc;
+ 	struct virt_dma_desc *vd;
+ 	unsigned long flags;
+-	u32 chid;
+ 
+ 	/*
+ 	 * If channel not active don't process event
+@@ -969,13 +970,9 @@
+ 	/* make sure rp updates are immediately visible to all cores */
+ 	smp_wmb();
+ 
+-	chid = imed_event->chid;
+-	if (imed_event->code == MSM_GPI_TCE_EOT && gpii->ieob_set) {
+-		if (chid == GPI_RX_CHAN)
+-			goto gpi_free_desc;
+-		else
+-			return;
+-	}
++	/* M52XQ v261: TX with UNLOCK: wait for the EOB of the unlock (RX EOT completes a read normally) */
++	if (imed_event->code == MSM_GPI_TCE_EOT && gpi_desc->m52xq_unlock)
++		return;
+ 
+ 	if (imed_event->code == MSM_GPI_TCE_UNEXP_ERR)
+ 		result.result = DMA_TRANS_ABORTED;
+@@ -986,7 +983,6 @@
+ 	dma_cookie_complete(&vd->tx);
+ 	dmaengine_desc_get_callback_invoke(&vd->tx, &result);
+ 
+-gpi_free_desc:
+ 	spin_lock_irqsave(&gchan->vc.lock, flags);
+ 	list_del(&vd->node);
+ 	spin_unlock_irqrestore(&gchan->vc.lock, flags);
+@@ -994,6 +990,24 @@
+ 	gpi_desc = NULL;
+ }
+ 
++/*
++ * M52XQ v260 (2026-11-16): trace of the GPI events (loud speaker silence: the TFA9878 bus i2c@984000 is a shared SE, its
++ * reads came back as 0x0000 and "Event without a pending descriptor!" came on the TX channel with code EOB).
++ * v261: the trace of every event is gone (8000 lines in 2 min hung the phone during a call), only orphans are logged.
++ */
++
++static void m52xq_trace_event(struct gchan *gchan, struct xfer_compl_event *ev, void *tre_virt, bool pending, const char *what)
++{
++	struct gpi_tre *tre = tre_virt;
++	u32 tre_type = tre ? (tre->dword[3] >> 16) & 0xff : 0xff;
++
++	dev_info(gchan->gpii->gpi_dev->dev,
++		 "m52xq %s: gpii %u ch %u code %u len %u tre %u (%08x %08x %08x %08x) pending %d ieob_set %d\n",
++		 what, gchan->gpii->gpii_id, ev->chid, ev->code, ev->length, tre_type,
++		 tre ? tre->dword[0] : 0, tre ? tre->dword[1] : 0, tre ? tre->dword[2] : 0, tre ? tre->dword[3] : 0,
++		 pending, gchan->gpii->ieob_set);
++}
++
+ /* processing transfer completion events */
+ static void gpi_process_xfer_compl_event(struct gchan *gchan,
+ 					 struct xfer_compl_event *compl_event)
+@@ -1005,7 +1019,6 @@
+ 	struct gpi_desc *gpi_desc;
+ 	struct dmaengine_result result;
+ 	unsigned long flags;
+-	u32 chid;
+ 
+ 	/* only process events on active channel */
+ 	if (unlikely(gchan->pm_state != ACTIVE_STATE)) {
+@@ -1016,6 +1029,8 @@
+ 
+ 	spin_lock_irqsave(&gchan->vc.lock, flags);
+ 	vd = vchan_next_desc(&gchan->vc);
++	if (!vd)
++		m52xq_trace_event(gchan, compl_event, ev_rp, false, "ORPHAN");
+ 	if (!vd) {
+ 		struct gpi_ere *gpi_ere;
+ 
+@@ -1044,13 +1059,9 @@
+ 	/* update must be visible to other cores */
+ 	smp_wmb();
+ 
+-	chid = compl_event->chid;
+-	if (compl_event->code == MSM_GPI_TCE_EOT && gpii->ieob_set) {
+-		if (chid == GPI_RX_CHAN)
+-			goto gpi_free_desc;
+-		else
+-			return;
+-	}
++	/* M52XQ v261: TX with UNLOCK: wait for the EOB of the unlock (RX EOT completes a read normally) */
++	if (compl_event->code == MSM_GPI_TCE_EOT && gpi_desc->m52xq_unlock)
++		return;
+ 
+ 	if (compl_event->code == MSM_GPI_TCE_UNEXP_ERR) {
+ 		dev_err(gpii->gpi_dev->dev, "Error in Transaction\n");
+@@ -1065,7 +1076,6 @@
+ 	dma_cookie_complete(&vd->tx);
+ 	dmaengine_desc_get_callback_invoke(&vd->tx, &result);
+ 
+-gpi_free_desc:
+ 	spin_lock_irqsave(&gchan->vc.lock, flags);
+ 	list_del(&vd->node);
+ 	spin_unlock_irqrestore(&gchan->vc.lock, flags);
+@@ -1732,7 +1742,12 @@
+ 		 * by gpi_process_xfer_compl_event() via ieob_set.
+ 		 */
+ 		tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_IEOB);
+-		chan->gpii->ieob_set = true;
++		/*
++		 * M52XQ v261: per descriptor. The old gpii-wide ieob_set was cleared by the RX prep of the same
++		 * read (gpi_prep_slave_sg), so the TX EOT completed the read before its data had arrived
++		 * (TFA9878 registers read as 0x0000 / stale) and the UNLOCK EOB became an orphan event.
++		 */
++		desc->m52xq_unlock = true;
+ 	}
+ 
+ 	for (i = 0; i < tre_idx; i++)
+diff -ruN a/drivers/gpu/drm/panel/panel-samsung-s6e3hab-amb667an01.c b/drivers/gpu/drm/panel/panel-samsung-s6e3hab-amb667an01.c
+--- a/drivers/gpu/drm/panel/panel-samsung-s6e3hab-amb667an01.c	2026-11-24 13:24:04.563905348 +0200
++++ b/drivers/gpu/drm/panel/panel-samsung-s6e3hab-amb667an01.c	2026-11-24 13:24:04.567905172 +0200
+@@ -53,16 +53,25 @@
+ static int s6e3hab_amb667an01_set_dark(struct mipi_dsi_device *dsi, bool dark);
+ static void s6e3hab_amb667an01_wake(struct s6e3hab_amb667an01 *ctx);
+ 
++/* M52XQ v256: user brightness of the panel (0 = user space keeps the screen dark) */
++static unsigned int s6e3hab_amb667an01_level(struct s6e3hab_amb667an01 *ctx)
++{
++	struct backlight_device *bl = ctx->panel.backlight;
++
++	return bl ? bl->props.brightness : 255;
++}
++
+ /* called with dark_resume_lock held */
+ static void dark_resume_end(void)
+ {
+ 	struct s6e3hab_amb667an01 *ctx = m52xq_panel;
+ 
+ 	dark_resume_on = false;
+-	if (ctx && ctx->enabled && ctx->asleep) {
++	/* v256: with brightness 0 the panel stays asleep; the next brightness > 0 wakes it */
++	if (ctx && ctx->enabled && ctx->asleep && s6e3hab_amb667an01_level(ctx)) {
+ 		dev_dbg(&ctx->dsi->dev, "M52XQ: dark resume ended, panel woken up\n");
+ 		s6e3hab_amb667an01_wake(ctx);
+-	} else if (ctx && ctx->enabled && ctx->resume_dark) {
++	} else if (ctx && ctx->enabled && ctx->resume_dark && !ctx->asleep && s6e3hab_amb667an01_level(ctx)) {
+ 		dev_dbg(&ctx->dsi->dev, "M52XQ: dark resume ended, display on\n");
+ 		s6e3hab_amb667an01_set_dark(ctx->dsi, false);
+ 	}
+@@ -298,11 +307,17 @@
+ 	 * itself stayed off (seen on 23.10). It stays in sleep/reset; dark_resume_end() wakes it if the phone
+ 	 * really wakes up (key, notification).
+ 	 */
++	/*
++	 * M52XQ v256: also while user space keeps the brightness at 0. Lomiri (classic) never switches the output off, it only
++	 * sets brightness 0 (DCS display off): the system suspend disabled the panel and the resume woke it up in the kernel,
++	 * before the system-sleep hook could set dark_resume - a flash on every Wi-Fi / mobile data / USB wake-up
++	 * (2026-11-08). With brightness 0 there is nothing to show: the panel sleeps until the brightness goes up.
++	 */
+ 	mutex_lock(&dark_resume_lock);
+-	if (dark_resume_active()) {
++	if (dark_resume_active() || !s6e3hab_amb667an01_level(ctx)) {
+ 		ctx->asleep = true;
+ 		mutex_unlock(&dark_resume_lock);
+-		dev_dbg(dev, "M52XQ: dark resume, panel kept asleep\n");
++		dev_info(dev, "M52XQ: panel kept asleep (%s)\n", dark_resume_on ? "dark resume" : "brightness 0");
+ 		return 0;
+ 	}
+ 	mutex_unlock(&dark_resume_lock);
+@@ -582,9 +597,21 @@
+ 	u16 level = min_t(u16, backlight_get_brightness(bl), 255);
+ 	int ret;
+ 
+-	/* v234: the panel is asleep (dark resume): the level is applied when it is woken up */
+-	if (ctx && READ_ONCE(ctx->asleep))
++	/*
++	 * v234: the panel is asleep (dark resume): the level is applied when it is woken up.
++	 * v256: outside the dark resume a brightness > 0 (power key, call) wakes it up here.
++	 */
++	if (ctx && READ_ONCE(ctx->asleep)) {
++		if (!bl->props.brightness || backlight_is_blank(bl))
++			return 0;
++		mutex_lock(&dark_resume_lock);
++		if (ctx->asleep && ctx->enabled && !dark_resume_active()) {
++			s6e3hab_amb667an01_wake(ctx);
++			dev_info(&dsi->dev, "M52XQ: panel woken up by brightness %d\n", bl->props.brightness);
++		}
++		mutex_unlock(&dark_resume_lock);
+ 		return 0;
++	}
+ 
+ 	if (!backlight_is_blank(bl)) {
+ 		if (bl->props.brightness == 0)
+diff -ruN a/drivers/i2c/busses/i2c-qcom-geni.c b/drivers/i2c/busses/i2c-qcom-geni.c
+--- a/drivers/i2c/busses/i2c-qcom-geni.c	2026-11-24 13:24:04.883891306 +0200
++++ b/drivers/i2c/busses/i2c-qcom-geni.c	2026-11-24 13:24:04.891890955 +0200
+@@ -731,7 +731,12 @@
+ 	 * M52XQ: the EOB of the TX half of a read only frees its TREs; the
+ 	 * transfer completes on the RX EOT, so no callback here.
+ 	 */
+-	if (!peripheral->link_ieob) {
++	/*
++	 * M52XQ v261: on a shared SE the TX half of a read (GO + UNLOCK) must not complete the transfer either:
++	 * only the RX EOT means the data is in the buffer (before, the TX half completed it and the TFA9878
++	 * registers read back as 0x0000 / stale values).
++	 */
++	if (!peripheral->link_ieob && !(op == I2C_WRITE && (msgs[msg_idx].flags & I2C_M_RD))) {
+ 		desc->callback_result = i2c_gpi_cb_result;
+ 		desc->callback_param = gi2c;
+ 	}
+diff -ruN a/drivers/media/platform/qcom/venus/hfi_cmds.c b/drivers/media/platform/qcom/venus/hfi_cmds.c
+--- a/drivers/media/platform/qcom/venus/hfi_cmds.c	2026-11-24 13:24:05.263874657 +0200
++++ b/drivers/media/platform/qcom/venus/hfi_cmds.c	2026-11-24 13:24:05.271874307 +0200
+@@ -1341,6 +1341,21 @@
+ 		pkt->shdr.hdr.size += sizeof(u32) + sizeof(*wr);
+ 		break;
+ 	}
++	case HFI_PROPERTY_CONFIG_VENC_FRAME_QP_6XX: {
++		/* m52xq: frame QP for Iris2 (msm_vidc layout) */
++		struct hfi_frame_qp_6xx *in = pdata, *qp = prop_data;
++
++		*qp = *in;
++		pkt->shdr.hdr.size += sizeof(u32) + sizeof(*qp);
++		break;
++	}
++	case HFI_PROPERTY_PARAM_VENC_BITRATE_TYPE_6XX: {
++		struct hfi_enable *in = pdata, *en = prop_data;
++
++		en->enable = in->enable;
++		pkt->shdr.hdr.size += sizeof(u32) + sizeof(*en);
++		break;
++	}
+ 	default:
+ 		return pkt_session_set_property_4xx(pkt, cookie, ptype, pdata);
+ 	}
+diff -ruN a/drivers/media/platform/qcom/venus/hfi_helper.h b/drivers/media/platform/qcom/venus/hfi_helper.h
+--- a/drivers/media/platform/qcom/venus/hfi_helper.h	2026-11-24 13:24:05.611859421 +0200
++++ b/drivers/media/platform/qcom/venus/hfi_helper.h	2026-11-24 13:24:05.615859246 +0200
+@@ -568,6 +568,25 @@
+ 	u32 extradata_addr;
+ };
+ 
++/*
++ * m52xq: Iris2 (HFI 6xx, SM7325) encoder properties as the Qualcomm msm_vidc driver sends them:
++ * the frame QP is a CONFIG with packed I/P/B values and an enable mask, bitrates are set for all
++ * layers (layer id 0xff); PARAM_VENC_SESSION_QP is not packed for 6xx at all.
++ */
++#define HFI_PROPERTY_CONFIG_VENC_FRAME_QP_6XX		0x2006012
++#define HFI_PROPERTY_PARAM_VENC_BITRATE_TYPE_6XX	0x2005031
++#define HFI_6XX_ALL_LAYER_ID				0xff
++#define HFI_6XX_QP_ENABLE_I				0x1
++#define HFI_6XX_QP_ENABLE_P				0x2
++#define HFI_6XX_QP_ENABLE_B				0x4
++
++struct hfi_frame_qp_6xx {
++	u32 qp_packed;
++	u32 layer_id;
++	u32 enable;
++	u32 reserved[3];
++};
++
+ struct hfi_bitrate {
+ 	u32 bitrate;
+ 	u32 layer_id;
+diff -ruN a/drivers/media/platform/qcom/venus/venc.c b/drivers/media/platform/qcom/venus/venc.c
+--- a/drivers/media/platform/qcom/venus/venc.c	2026-11-24 13:24:05.979843310 +0200
++++ b/drivers/media/platform/qcom/venus/venc.c	2026-11-24 13:24:05.983843135 +0200
+@@ -878,9 +878,19 @@
+ 		if (rate_control != HFI_RATE_CONTROL_OFF)
+ 			bitrate = m52xq_venc_bitrate(inst, bitrate);
+ 
++		/* m52xq: Iris2 takes the bitrate for all layers (msm_vidc: BITRATE_TYPE 0, layer id 0xff) */
++		if (IS_V6(inst->core)) {
++			struct hfi_enable bt = { .enable = 0 };
++
++			ptype = HFI_PROPERTY_PARAM_VENC_BITRATE_TYPE_6XX;
++			ret = hfi_session_set_property(inst, ptype, &bt);
++			if (ret)
++				return ret;
++		}
++
+ 		ptype = HFI_PROPERTY_CONFIG_VENC_TARGET_BITRATE;
+ 		brate.bitrate = bitrate;
+-		brate.layer_id = 0;
++		brate.layer_id = IS_V6(inst->core) ? HFI_6XX_ALL_LAYER_ID : 0;
+ 
+ 		ret = hfi_session_set_property(inst, ptype, &brate);
+ 		if (ret)
+@@ -892,13 +902,16 @@
+ 		else
+ 			bitrate = ctr->bitrate_peak;
+ 
+-		ptype = HFI_PROPERTY_CONFIG_VENC_MAX_BITRATE;
+-		brate.bitrate = bitrate;
+-		brate.layer_id = 0;
+-
+-		ret = hfi_session_set_property(inst, ptype, &brate);
+-		if (ret)
+-			return ret;
++		/* m52xq: msm_vidc does not send a max bitrate to Iris2 (no such config in its table) */
++		if (!IS_V6(inst->core)) {
++			ptype = HFI_PROPERTY_CONFIG_VENC_MAX_BITRATE;
++			brate.bitrate = bitrate;
++			brate.layer_id = 0;
++
++			ret = hfi_session_set_property(inst, ptype, &brate);
++			if (ret)
++				return ret;
++		}
+ 	}
+ 
+ 	if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_H264 ||
+@@ -914,6 +927,35 @@
+ 			return ret;
+ 	}
+ 
++	/*
++	 * m52xq: Iris2 (HFI 6xx) never got PARAM_VENC_SESSION_QP (the 4xx packer returns -ENOTSUPP, which is
++	 * ignored): send the frame QP as msm_vidc does - CONFIG_VENC_FRAME_QP with packed I/P/B and an enable
++	 * mask, for all layers. With rate control on only when the client set the QP away from the default.
++	 */
++	if (IS_V6(inst->core) && inst->fmt_cap->pixfmt != V4L2_PIX_FMT_VP8) {
++		struct hfi_frame_qp_6xx fqp = {};
++		u32 qi, qpp, qb;
++
++		if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_HEVC) {
++			qi = ctr->hevc_i_qp;
++			qpp = ctr->hevc_p_qp;
++			qb = ctr->hevc_b_qp;
++		} else {
++			qi = ctr->h264_i_qp;
++			qpp = ctr->h264_p_qp;
++			qb = ctr->h264_b_qp;
++		}
++		fqp.qp_packed = qi | qpp << 8 | qb << 16;
++		fqp.layer_id = HFI_6XX_ALL_LAYER_ID;
++		fqp.enable = HFI_6XX_QP_ENABLE_I | HFI_6XX_QP_ENABLE_P | HFI_6XX_QP_ENABLE_B;
++		if (rate_control == HFI_RATE_CONTROL_OFF) {
++			ret = hfi_session_set_property(inst, HFI_PROPERTY_CONFIG_VENC_FRAME_QP_6XX, &fqp);
++			if (ret)
++				return ret;
++			dev_dbg(inst->core->dev, "m52xq: frame QP %u/%u/%u (rate control off)\n", qi, qpp, qb);
++		}
++	}
++
+ 	ptype = HFI_PROPERTY_PARAM_VENC_SESSION_QP;
+ 	if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_HEVC) {
+ 		quant.qp_i = ctr->hevc_i_qp;
+diff -ruN a/drivers/net/wireless/ath/ath11k/ahb.c b/drivers/net/wireless/ath/ath11k/ahb.c
+--- a/drivers/net/wireless/ath/ath11k/ahb.c	2026-11-24 13:24:06.331827931 +0200
++++ b/drivers/net/wireless/ath/ath11k/ahb.c	2026-11-24 13:24:06.335827756 +0200
+@@ -1326,6 +1326,10 @@
+ 	ath11k_ahb_free_resources(ab);
+ }
+ 
++static bool m52xq_off_ps = true;
++module_param(m52xq_off_ps, bool, 0644);
++MODULE_PARM_DESC(m52xq_off_ps, "M52XQ: send SMP2P POWER_SAVE_ENTER at system suspend while the radio is off");
++
+ static __maybe_unused int ath11k_ahb_pm_suspend(struct device *dev)
+ {
+ 	struct ath11k_base *ab = dev_get_drvdata(dev);
+@@ -1338,6 +1342,24 @@
+ 	if (ret && ret != -EOPNOTSUPP)
+ 		ath11k_warn(ab, "failed to suspend core: %d\n", ret);
+ 
++	/*
++	 * m52xq: WCN6750 has supports_suspend = false, so the core does nothing at system suspend and POWER_SAVE_ENTER
++	 * is only sent by the mac80211 WoW path, i.e. with an interface up. With the radio off (rfkill from the quick
++	 * settings, interface down) nobody told WPSS to sleep: it stayed awake all night (qcom_stats wpss 5 s of 12 h,
++	 * ~2 %/h; 2026-11-08). Send it here when the radio is off, and POWER_SAVE_EXIT at resume.
++	 */
++	if (ret == -EOPNOTSUPP && m52xq_off_ps && ab->hw_rev == ATH11K_HW_WCN6750_HW10) {
++		struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ab);
++		struct ath11k *ar = ab->pdevs[0].ar;
++
++		if (ar && ar->state == ATH11K_STATE_OFF &&
++		    !test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags) &&
++		    !ath11k_ahb_hif_suspend(ab)) {
++			ab_ahb->m52xq_off_ps = true;
++			ath11k_dbg(ab, ATH11K_DBG_AHB, "m52xq: radio off, power save enter sent\n");
++		}
++	}
++
+ 	/* do not block the system suspend */
+ 	return 0;
+ }
+@@ -1350,6 +1372,27 @@
+ 	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags))
+ 		return 0;
+ 
++	{
++		struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ab);
++
++		if (ab_ahb->m52xq_off_ps) {
++			u32 value;
++
++			/*
++			 * With the radio off the firmware sends no WoW wakeup event for POWER_SAVE_EXIT: waiting for it
++			 * (ath11k_ahb_hif_resume) only delayed every resume by 3 s. Send it and go on.
++			 */
++			ab_ahb->m52xq_off_ps = false;
++			disable_irq_wake(ab->irq_num[ATH11K_PCI_IRQ_CE0_OFFSET + ATH11K_PCI_CE_WAKE_IRQ]);
++			value = u32_encode_bits(ab_ahb->smp2p_info.seq_no++, ATH11K_AHB_SMP2P_SMEM_SEQ_NO);
++			value |= u32_encode_bits(ATH11K_AHB_POWER_SAVE_EXIT, ATH11K_AHB_SMP2P_SMEM_MSG);
++			ret = qcom_smem_state_update_bits(ab_ahb->smp2p_info.smem_state,
++							  ATH11K_AHB_SMP2P_SMEM_VALUE_MASK, value);
++			if (ret)
++				ath11k_warn(ab, "m52xq: power save exit with the radio off: %d\n", ret);
++		}
++	}
++
+ 	ret = ath11k_core_resume(ab);
+ 	if (ret && ret != -EOPNOTSUPP)
+ 		ath11k_warn(ab, "failed to resume core: %d\n", ret);
+diff -ruN a/drivers/net/wireless/ath/ath11k/ahb.h b/drivers/net/wireless/ath/ath11k/ahb.h
+--- a/drivers/net/wireless/ath/ath11k/ahb.h	2026-11-24 13:24:06.707811508 +0200
++++ b/drivers/net/wireless/ath/ath11k/ahb.h	2026-11-24 13:24:06.711811332 +0200
+@@ -23,6 +23,8 @@
+ 
+ struct ath11k_ahb {
+ 	struct rproc *tgt_rproc;
++	/* m52xq: POWER_SAVE_ENTER was sent at system suspend with the radio off */
++	bool m52xq_off_ps;
+ 	struct {
+ 		struct device *dev;
+ 		struct iommu_domain *iommu_domain;
+diff -ruN a/drivers/power/supply/sm5714_charger.c b/drivers/power/supply/sm5714_charger.c
+--- a/drivers/power/supply/sm5714_charger.c	2026-11-24 13:24:07.371782539 +0200
++++ b/drivers/power/supply/sm5714_charger.c	2026-11-24 13:24:07.375782363 +0200
+@@ -737,6 +737,8 @@
+ 	return 0;
+ }
+ 
++static char *sm5714_chg_supplied_to[] = { "battery" };
++
+ static int sm5714_chg_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+@@ -771,6 +773,9 @@
+ 
+ 	cfg.drv_data = chg;
+ 	cfg.fwnode = dev_fwnode(dev);
++	/* v257: the fuel gauge (upstream driver) asks power_supply_am_i_supplied() */
++	cfg.supplied_to = sm5714_chg_supplied_to;
++	cfg.num_supplicants = ARRAY_SIZE(sm5714_chg_supplied_to);
+ 	chg->psy = devm_power_supply_register(dev, &sm5714_chg_desc, &cfg);
+ 	if (IS_ERR(chg->psy))
+ 		return dev_err_probe(dev, PTR_ERR(chg->psy), "failed to register charger\n");
+diff -ruN a/drivers/power/supply/sm5714_fg.c b/drivers/power/supply/sm5714_fg.c
+--- a/drivers/power/supply/sm5714_fg.c	2026-11-24 13:24:07.691768591 +0200
++++ b/drivers/power/supply/sm5714_fg.c	2026-11-24 13:24:07.695768417 +0200
+@@ -1,28 +1,31 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Read-only driver for the fuel gauge part of the Silicon Mitus SM5714
+- * (Samsung Galaxy M52 5G). Every value is read from the gauge SRAM: the SRAM
+- * address is written to RADDR, then the 16-bit word is read from RDATA.
+- * Nothing else is ever written -- charging stays under hardware control.
+- * Conversions follow Samsung's sm5714_fuelgauge.c.
++ * Silicon Mitus SM5714 fuel gauge driver
+  *
+- * The gauge's own temperature reading jumps by ~3.5 degC with the charge
+- * current, so like the stock sec_battery (thermal_source = ADC) the battery
+- * temperature comes from the battery NTC on the PMIC ADC when io-channels
+- * points at it, converted with Samsung's M52 temp_table_adc/temp_table_data.
++ * The gauge keeps its results in an internal SRAM: the SRAM address is
++ * written to RADDR, then the 16-bit word is read from RDATA. The driver only
++ * reads; the gauge algorithm and charging stay under hardware control. The
++ * conversions follow the vendor driver.
++ *
++ * The temperature measured by the gauge itself rises with the charge current,
++ * so the battery temperature is read from the battery thermistor ADC channel
++ * when the devicetree provides one.
+  */
+ 
+-#include <linux/delay.h>
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/devm-helpers.h>
+ #include <linux/i2c.h>
+ #include <linux/iio/consumer.h>
++#include <linux/minmax.h>
+ #include <linux/module.h>
++#include <linux/mod_devicetable.h>
+ #include <linux/mutex.h>
+-#include <linux/of.h>
+ #include <linux/power_supply.h>
++#include <linux/regmap.h>
+ #include <linux/workqueue.h>
+ 
+ #define SM5714_FG_REG_DEVICE_ID		0x00
+-#define SM5714_FG_REG_SYSTEM_STATUS	0x10
+ #define SM5714_FG_REG_AUX_STAT		0x22
+ #define SM5714_FG_REG_SRAM_RADDR	0x8c
+ #define SM5714_FG_REG_SRAM_RDATA	0x8d
+@@ -35,151 +38,123 @@
+ #define SM5714_FG_SRAM_VBAT_AVG		0x08
+ #define SM5714_FG_SRAM_CURRENT_AVG	0x09
+ 
+-#define SM5714_AUX_STAT_CHG_ON		BIT(5)
+-#define SM5714_AUX_STAT_CURR_X2_5	BIT(10)
+-
+-#define SM5714_FG_POLL_INTERVAL		(60 * HZ)
++#define SM5714_FG_AUX_STAT_CHG_ON	BIT(5)
++#define SM5714_FG_AUX_STAT_CURR_X2_5	BIT(10)
+ 
+-/* PM7325 ADC7 GPIO2_100K_PU: Samsung's "adc-temp" battery NTC */
+-#define SM5714_FG_NTC_ADC_CHANNEL	0x14b
+-#define SM5714_FG_NTC_SAMPLES		5	/* sec_battery adc_check_count */
++#define SM5714_FG_SIGN			BIT(15)
++#define SM5714_FG_MAGNITUDE		GENMASK(14, 0)
+ 
+-/*
+- * Samsung's M52 temp_table_adc/temp_table_data mapped onto the temperature the
+- * mainline ADC7 driver reports for the same ADC code (100k NTC, 100k pull-up):
+- * { mainline millidegC, Samsung 0.1 degC }.
+- */
+-static const int sm5714_fg_ntc_table[][2] = {
+-	{ -19638, -200 }, { -14589, -150 }, {  -9587, -100 }, {  -4656,  -50 },
+-	{    319,    0 }, {   4502,   50 }, {   9403,  100 }, {  14228,  150 },
+-	{  19132,  200 }, {  23919,  250 }, {  28742,  300 }, {  33449,  350 },
+-	{  39241,  400 }, {  44659,  450 }, {  49903,  500 }, {  54928,  550 },
+-	{  59750,  600 }, {  64934,  650 }, {  70376,  700 }, {  75736,  750 },
+-	{  80928,  800 }, {  86135,  850 }, {  91292,  900 },
+-};
++/* the gauge interrupt is not used: report changes periodically */
++#define SM5714_FG_POLL_INTERVAL		(60 * HZ)
+ 
+ struct sm5714_fg {
+-	struct i2c_client *client;
++	struct regmap *regmap;
+ 	struct power_supply *psy;
+ 	struct iio_channel *ntc;	/* NULL: use the gauge temperature */
+-	struct mutex lock;
++	struct mutex lock;		/* RADDR/RDATA pair */
+ 	struct delayed_work work;
+ };
+ 
+-static int sm5714_fg_read_sram(struct sm5714_fg *fg, u8 addr)
++static const struct regmap_config sm5714_fg_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 16,
++	.val_format_endian = REGMAP_ENDIAN_LITTLE,
++	.max_register = SM5714_FG_REG_SRAM_RDATA,
++};
++
++static int sm5714_fg_read_sram(struct sm5714_fg *fg, u8 addr, unsigned int *val)
+ {
+ 	int ret;
+ 
+ 	mutex_lock(&fg->lock);
+-	ret = i2c_smbus_write_word_data(fg->client, SM5714_FG_REG_SRAM_RADDR, addr);
++	ret = regmap_write(fg->regmap, SM5714_FG_REG_SRAM_RADDR, addr);
+ 	if (!ret)
+-		ret = i2c_smbus_read_word_data(fg->client, SM5714_FG_REG_SRAM_RDATA);
++		ret = regmap_read(fg->regmap, SM5714_FG_REG_SRAM_RDATA, val);
+ 	mutex_unlock(&fg->lock);
+ 
+ 	return ret;
+ }
+ 
+-/* mV */
+-static int sm5714_fg_raw_to_mv(int raw)
++/* 0.1 % */
++static int sm5714_fg_soc_permille(unsigned int raw)
+ {
+-	if (raw & 0x8000)
+-		return 2700 - ((raw & 0x7fff) * 10) / 109;
+-	return (raw * 10) / 109 + 2700;
++	return (raw * 10) >> 8;
+ }
+ 
+-/* mA, positive while charging */
+-static int sm5714_fg_raw_to_ma(int raw, int aux)
++/* mV */
++static int sm5714_fg_raw_to_mv(unsigned int raw)
+ {
+-	int ma = ((raw & 0x7fff) * 1000) / 2044;
++	int mv = (FIELD_GET(SM5714_FG_MAGNITUDE, raw) * 10) / 109;
+ 
+-	if (raw & 0x8000)
+-		ma = -ma;
+-	if (aux & SM5714_AUX_STAT_CURR_X2_5)
+-		ma = ma * 25 / 10;
+-
+-	return ma;
++	return raw & SM5714_FG_SIGN ? 2700 - mv : 2700 + mv;
+ }
+ 
+-static int sm5714_fg_get_current(struct sm5714_fg *fg, u8 sram, int *ma)
++/* mA, positive while charging */
++static int sm5714_fg_get_current_ma(struct sm5714_fg *fg, u8 sram, int *ma)
+ {
+-	int raw, aux;
+-
+-	raw = sm5714_fg_read_sram(fg, sram);
+-	if (raw < 0)
+-		return raw;
+-	aux = i2c_smbus_read_word_data(fg->client, SM5714_FG_REG_AUX_STAT);
+-	if (aux < 0)
+-		return aux;
++	unsigned int raw, aux;
++	int ret;
+ 
+-	*ma = sm5714_fg_raw_to_ma(raw, aux);
+-	return 0;
+-}
++	ret = sm5714_fg_read_sram(fg, sram, &raw);
++	if (ret)
++		return ret;
++	ret = regmap_read(fg->regmap, SM5714_FG_REG_AUX_STAT, &aux);
++	if (ret)
++		return ret;
+ 
+-static int sm5714_fg_ntc_to_decidegc(int mdegc)
+-{
+-	const int (*t)[2] = sm5714_fg_ntc_table;
+-	int i, n = ARRAY_SIZE(sm5714_fg_ntc_table);
++	*ma = (FIELD_GET(SM5714_FG_MAGNITUDE, raw) * 1000) / 2044;
++	if (raw & SM5714_FG_SIGN)
++		*ma = -*ma;
++	if (aux & SM5714_FG_AUX_STAT_CURR_X2_5)
++		*ma = *ma * 25 / 10;
+ 
+-	if (mdegc <= t[0][0])
+-		return t[0][1];
+-	for (i = 1; i < n; i++)
+-		if (mdegc < t[i][0])
+-			return t[i - 1][1] + (t[i][1] - t[i - 1][1]) *
+-			       (mdegc - t[i - 1][0]) / (t[i][0] - t[i - 1][0]);
+-	return t[n - 1][1];
++	return 0;
+ }
+ 
+-/* 0.1 degC, mean of the samples without the lowest and the highest */
+-static int sm5714_fg_get_ntc_temp(struct sm5714_fg *fg, int *temp)
++/* 0.1 degC */
++static int sm5714_fg_get_temp(struct sm5714_fg *fg, int *temp)
+ {
+-	int i, v, ret, sum = 0, lo = INT_MAX, hi = INT_MIN;
++	unsigned int raw;
++	int ret, mdegc;
+ 
+-	for (i = 0; i < SM5714_FG_NTC_SAMPLES; i++) {
+-		ret = iio_read_channel_processed(fg->ntc, &v);
++	if (fg->ntc) {
++		ret = iio_read_channel_processed(fg->ntc, &mdegc);
+ 		if (ret < 0)
+ 			return ret;
+-		sum += v;
+-		lo = min(lo, v);
+-		hi = max(hi, v);
++		*temp = mdegc / 100;
++		return 0;
+ 	}
+ 
+-	*temp = sm5714_fg_ntc_to_decidegc((sum - lo - hi) / (SM5714_FG_NTC_SAMPLES - 2));
+-	return 0;
+-}
+-
+-/* the charger stops by itself after top-off; the adapter is still there */
+-static bool sm5714_fg_adapter_online(void)
+-{
+-	union power_supply_propval val;
+-	struct power_supply *chg;
+-	int ret;
++	ret = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_TEMPERATURE, &raw);
++	if (ret)
++		return ret;
+ 
+-	chg = power_supply_get_by_name("sm5714-charger");
+-	if (!chg)
+-		return false;
+-	ret = power_supply_get_property(chg, POWER_SUPPLY_PROP_ONLINE, &val);
+-	power_supply_put(chg);
++	*temp = ((FIELD_GET(SM5714_FG_MAGNITUDE, raw) * 10) * 2989) >> 19;
++	if (raw & SM5714_FG_SIGN)
++		*temp = -*temp;
+ 
+-	return !ret && val.intval;
++	return 0;
+ }
+ 
+ static int sm5714_fg_get_status(struct sm5714_fg *fg, int *status)
+ {
+-	int soc, aux, ma, ret;
++	unsigned int aux, soc;
++	int ma, ret;
+ 
+-	aux = i2c_smbus_read_word_data(fg->client, SM5714_FG_REG_AUX_STAT);
+-	if (aux < 0)
+-		return aux;
+-	soc = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_SOC);
+-	if (soc < 0)
+-		return soc;
+-	ret = sm5714_fg_get_current(fg, SM5714_FG_SRAM_CURRENT_AVG, &ma);
++	ret = regmap_read(fg->regmap, SM5714_FG_REG_AUX_STAT, &aux);
++	if (ret)
++		return ret;
++	ret = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_SOC, &soc);
++	if (ret)
++		return ret;
++	ret = sm5714_fg_get_current_ma(fg, SM5714_FG_SRAM_CURRENT_AVG, &ma);
+ 	if (ret)
+ 		return ret;
+ 
+-	if (!(aux & SM5714_AUX_STAT_CHG_ON) && !sm5714_fg_adapter_online())
++	/* the charger stops after top-off while the adapter stays connected */
++	if (!(aux & SM5714_FG_AUX_STAT_CHG_ON) && power_supply_am_i_supplied(fg->psy) <= 0)
+ 		*status = POWER_SUPPLY_STATUS_DISCHARGING;
+-	else if (((soc * 10) >> 8) >= 990)
++	else if (sm5714_fg_soc_permille(soc) >= 990)
+ 		*status = POWER_SUPPLY_STATUS_FULL;
+ 	else if (ma > 0)
+ 		*status = POWER_SUPPLY_STATUS_CHARGING;
+@@ -194,65 +169,55 @@
+ 				  union power_supply_propval *val)
+ {
+ 	struct sm5714_fg *fg = power_supply_get_drvdata(psy);
+-	int raw, ret = 0;
++	unsigned int raw;
++	int ret;
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+-		ret = sm5714_fg_get_status(fg, &val->intval);
+-		break;
++		return sm5714_fg_get_status(fg, &val->intval);
+ 	case POWER_SUPPLY_PROP_PRESENT:
+ 		val->intval = 1;
+-		break;
++		return 0;
+ 	case POWER_SUPPLY_PROP_TECHNOLOGY:
+ 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
+-		break;
++		return 0;
+ 	case POWER_SUPPLY_PROP_CAPACITY:
+-		raw = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_SOC);
+-		if (raw < 0)
+-			return raw;
+-		/* 0.1 % units, rounded */
+-		val->intval = clamp((((raw * 10) >> 8) + 5) / 10, 0, 100);
+-		break;
++		ret = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_SOC, &raw);
++		if (ret)
++			return ret;
++		val->intval = clamp((sm5714_fg_soc_permille(raw) + 5) / 10, 0, 100);
++		return 0;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+ 	case POWER_SUPPLY_PROP_VOLTAGE_AVG:
+-		raw = sm5714_fg_read_sram(fg, psp == POWER_SUPPLY_PROP_VOLTAGE_NOW ?
+-					  SM5714_FG_SRAM_VBAT : SM5714_FG_SRAM_VBAT_AVG);
+-		if (raw < 0)
+-			return raw;
++		ret = sm5714_fg_read_sram(fg, psp == POWER_SUPPLY_PROP_VOLTAGE_NOW ?
++					  SM5714_FG_SRAM_VBAT : SM5714_FG_SRAM_VBAT_AVG, &raw);
++		if (ret)
++			return ret;
+ 		val->intval = sm5714_fg_raw_to_mv(raw) * 1000;
+-		break;
++		return 0;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
+-		raw = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_OCV);
+-		if (raw < 0)
+-			return raw;
++		ret = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_OCV, &raw);
++		if (ret)
++			return ret;
+ 		val->intval = ((raw * 1000) >> 11) * 1000;
+-		break;
++		return 0;
+ 	case POWER_SUPPLY_PROP_CURRENT_NOW:
+ 	case POWER_SUPPLY_PROP_CURRENT_AVG:
+-		ret = sm5714_fg_get_current(fg, psp == POWER_SUPPLY_PROP_CURRENT_NOW ?
+-					    SM5714_FG_SRAM_CURRENT : SM5714_FG_SRAM_CURRENT_AVG,
+-					    &val->intval);
++		ret = sm5714_fg_get_current_ma(fg, psp == POWER_SUPPLY_PROP_CURRENT_NOW ?
++					       SM5714_FG_SRAM_CURRENT :
++					       SM5714_FG_SRAM_CURRENT_AVG, &val->intval);
++		if (ret)
++			return ret;
+ 		val->intval *= 1000;
+-		break;
++		return 0;
+ 	case POWER_SUPPLY_PROP_TEMP:
+-		if (fg->ntc)
+-			return sm5714_fg_get_ntc_temp(fg, &val->intval);
+-		raw = sm5714_fg_read_sram(fg, SM5714_FG_SRAM_TEMPERATURE);
+-		if (raw < 0)
+-			return raw;
+-		/* 0.1 degC */
+-		val->intval = (((raw & 0x7fff) * 10) * 2989) >> 19;
+-		if (raw & 0x8000)
+-			val->intval = -val->intval;
+-		break;
++		return sm5714_fg_get_temp(fg, &val->intval);
+ 	default:
+ 		return -EINVAL;
+ 	}
+-
+-	return ret;
+ }
+ 
+-static enum power_supply_property sm5714_fg_props[] = {
++static const enum power_supply_property sm5714_fg_props[] = {
+ 	POWER_SUPPLY_PROP_STATUS,
+ 	POWER_SUPPLY_PROP_PRESENT,
+ 	POWER_SUPPLY_PROP_TECHNOLOGY,
+@@ -273,7 +238,6 @@
+ 	.get_property	= sm5714_fg_get_property,
+ };
+ 
+-/* The gauge has no interrupt wired here: notify userspace periodically. */
+ static void sm5714_fg_work(struct work_struct *work)
+ {
+ 	struct sm5714_fg *fg = container_of(work, struct sm5714_fg, work.work);
+@@ -282,82 +246,51 @@
+ 	schedule_delayed_work(&fg->work, SM5714_FG_POLL_INTERVAL);
+ }
+ 
+-static void sm5714_fg_cancel_work(void *data)
+-{
+-	cancel_delayed_work_sync(data);
+-}
+-
+-/*
+- * The PMIC ADC node comes from the Samsung DTBO overlay, so io-channels holds
+- * a fixed phandle number. Check that it still resolves to the battery NTC
+- * channel before using it: a stale phandle must not defer the gauge forever.
+- * v253: the ADC node is "vadc" in the downstream DT and "adc@3100" in the
+- * upstream-style DT; with only "vadc" accepted the gauge used its own die
+- * temperature, which heats up while charging (9 V AFC flapping to 5 V).
+- */
+-static struct iio_channel *sm5714_fg_get_ntc(struct device *dev)
+-{
+-	struct of_phandle_args args;
+-	struct iio_channel *ntc;
+-	bool ok;
+-
+-	if (of_parse_phandle_with_args(dev->of_node, "io-channels",
+-				       "#io-channel-cells", 0, &args))
+-		return NULL;
+-	ok = (of_node_name_eq(args.np, "vadc") || of_node_name_eq(args.np, "adc")) &&
+-	     args.args_count == 1 &&
+-	     args.args[0] == SM5714_FG_NTC_ADC_CHANNEL;
+-	of_node_put(args.np);
+-	if (!ok) {
+-		dev_warn(dev, "io-channels is not the battery NTC, using gauge temperature\n");
+-		return NULL;
+-	}
+-
+-	ntc = devm_iio_channel_get(dev, NULL);
+-	if (IS_ERR(ntc) && PTR_ERR(ntc) != -EPROBE_DEFER) {
+-		dev_warn(dev, "battery NTC unavailable (%pe), using gauge temperature\n", ntc);
+-		return NULL;
+-	}
+-
+-	return ntc;
+-}
+-
+ static int sm5714_fg_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+ 	struct power_supply_config cfg = {};
+ 	struct sm5714_fg *fg;
+-	int id, ret;
+-
+-	id = i2c_smbus_read_word_data(client, SM5714_FG_REG_DEVICE_ID);
+-	if (id < 0)
+-		return dev_err_probe(dev, id, "failed to read device id\n");
++	unsigned int id;
++	int ret;
+ 
+ 	fg = devm_kzalloc(dev, sizeof(*fg), GFP_KERNEL);
+ 	if (!fg)
+ 		return -ENOMEM;
+ 
+-	fg->client = client;
+-	mutex_init(&fg->lock);
++	ret = devm_mutex_init(dev, &fg->lock);
++	if (ret)
++		return ret;
++
++	fg->regmap = devm_regmap_init_i2c(client, &sm5714_fg_regmap_config);
++	if (IS_ERR(fg->regmap))
++		return dev_err_probe(dev, PTR_ERR(fg->regmap), "failed to init regmap\n");
+ 
+-	fg->ntc = sm5714_fg_get_ntc(dev);
+-	if (IS_ERR(fg->ntc))
+-		return dev_err_probe(dev, PTR_ERR(fg->ntc), "battery NTC not ready\n");
++	ret = regmap_read(fg->regmap, SM5714_FG_REG_DEVICE_ID, &id);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to read device id\n");
++
++	fg->ntc = devm_iio_channel_get(dev, NULL);
++	if (IS_ERR(fg->ntc)) {
++		ret = PTR_ERR(fg->ntc);
++		if (ret != -ENODEV)
++			return dev_err_probe(dev, ret, "failed to get thermistor channel\n");
++		fg->ntc = NULL;
++	}
+ 
+ 	cfg.drv_data = fg;
+ 	cfg.fwnode = dev_fwnode(dev);
+ 	fg->psy = devm_power_supply_register(dev, &sm5714_fg_desc, &cfg);
+ 	if (IS_ERR(fg->psy))
+-		return dev_err_probe(dev, PTR_ERR(fg->psy), "failed to register battery\n");
++		return dev_err_probe(dev, PTR_ERR(fg->psy), "failed to register power supply\n");
+ 
+-	INIT_DELAYED_WORK(&fg->work, sm5714_fg_work);
+-	ret = devm_add_action_or_reset(dev, sm5714_fg_cancel_work, &fg->work);
++	ret = devm_delayed_work_autocancel(dev, &fg->work, sm5714_fg_work);
+ 	if (ret)
+ 		return ret;
+ 	schedule_delayed_work(&fg->work, SM5714_FG_POLL_INTERVAL);
+ 
+-	dev_info(dev, "SM5714 fuel gauge, device id 0x%04x, temperature from %s\n",
+-		 id, fg->ntc ? "battery NTC" : "gauge");
++	dev_dbg(dev, "device id 0x%04x, temperature from %s\n", id,
++		fg->ntc ? "battery thermistor" : "fuel gauge");
+ 
+ 	return 0;
+ }
+@@ -377,5 +310,6 @@
+ };
+ module_i2c_driver(sm5714_fg_driver);
+ 
+-MODULE_DESCRIPTION("Silicon Mitus SM5714 fuel gauge (read-only)");
++MODULE_AUTHOR("Asdlerto Korry <korryasdlerto@gmail.com>");
++MODULE_DESCRIPTION("Silicon Mitus SM5714 fuel gauge driver");
+ MODULE_LICENSE("GPL");
+diff -ruN a/sound/soc/codecs/tfa9878.c b/sound/soc/codecs/tfa9878.c
+--- a/sound/soc/codecs/tfa9878.c	2026-11-24 13:24:08.335740557 +0200
++++ b/sound/soc/codecs/tfa9878.c	2026-11-24 13:24:08.339740382 +0200
+@@ -12,10 +12,14 @@
+ 
+ #include <linux/bits.h>
+ #include <linux/delay.h>
++#include <linux/devm-helpers.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/regmap.h>
++#include <linux/slab.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+@@ -79,6 +83,12 @@
+ 	unsigned int slot_width;
+ 	u8 gain;		/* AMPGAIN, "Speaker Amp Gain" control (the call volume of the loud speaker) */
+ 	bool on;
++	/* m52xq v259: retries in the background (the voice session is not re-created any more) */
++	struct mutex lock;
++	struct delayed_work retry_work;
++	bool wanted;		/* the DAPM widget is powered */
++	int retries_left;
++	int retries_done;
+ };
+ 
+ static int tfa_set_bf(struct regmap *map, u16 bf, u16 val)
+@@ -120,10 +130,84 @@
+  * m52xq: the I2C writes of the power-up sequence used to be fire-and-forget. During a voice call the GPI DMA that serves this bus
+  * (gpi 900000: "Event without a pending descriptor!") sometimes loses a transfer when the route is switched, the amplifier stayed
+  * half configured and the loud speaker was silent (it worked on the 3rd try). Every transfer is now checked, the state is read
+- * back and the whole sequence is repeated (at most TFA_POWERUP_TRIES times).
++ * back and the whole sequence is repeated (v259: once at once, then in the background, see tfa9878_retry_work).
+  */
+ #define TFA_POWERUP_TRIES	4
+ 
++/*
++ * m52xq (2026-11-16, boot v258): the read back of PWDN/AMPE/MANSCONF passed while the loud speaker stayed silent: a call
++ * on pmOS Phosh showed "Event without a pending descriptor!" exactly on the silent switches and never on the good ones,
++ * the driver reported no error. A write of another register of the sequence was lost. Build the register image the
++ * sequence must leave (full register writes, then every bitfield write in order) and compare all of it; rewrite the
++ * differing bits once, a difference that stays fails the try (the whole sequence is repeated).
++ */
++#define TFA_NREGS	0x100
++
++struct tfa_image {
++	u16 val[TFA_NREGS];
++	u16 mask[TFA_NREGS];	/* bits that the sequence set and that must read back the same */
++};
++
++static void tfa_image_bf(struct tfa_image *im, u16 bf, u16 val)
++{
++	unsigned int reg = bf >> 8, pos = (bf >> 4) & 0xf, len = (bf & 0xf) + 1;
++	u16 mask = GENMASK(pos + len - 1, pos);
++
++	im->val[reg] = (im->val[reg] & ~mask) | ((val << pos) & mask);
++	im->mask[reg] |= mask;
++}
++
++static void tfa_image_build(struct tfa9878 *tfa, struct tfa_image *im)
++{
++	int i;
++
++	memset(im, 0, sizeof(*im));
++	for (i = 0; i < ARRAY_SIZE(tfa9878_rev1a78_regs); i++) {
++		im->val[tfa9878_rev1a78_regs[i].reg] = tfa9878_rev1a78_regs[i].val;
++		im->mask[tfa9878_rev1a78_regs[i].reg] = 0xffff;
++	}
++	for (i = 0; i < ARRAY_SIZE(tfa9878_dev_bfs); i++)
++		tfa_image_bf(im, tfa9878_dev_bfs[i].bf, tfa9878_dev_bfs[i].val);
++	tfa_image_bf(im, TFA_BF_AUDFS, tfa9878_rate_code(tfa->rate));
++	for (i = 0; i < ARRAY_SIZE(tfa9878_music_bfs); i++)
++		tfa_image_bf(im, tfa9878_music_bfs[i].bf, tfa9878_music_bfs[i].val);
++	tfa_image_bf(im, TFA_BF_DCA, 0);
++	tfa_image_bf(im, TFA_BF_MANSCONF, 1);
++	tfa_image_bf(im, TFA_BF_PWDN, 0);
++	tfa_image_bf(im, TFA_BF_AMPGAIN, tfa->gain);
++	tfa_image_bf(im, TFA_BF_AMPE, 1);
++
++	/* the chip may adjust AUDFS / AMPGAIN itself (see the read back below), I2CR clears itself */
++	im->mask[TFA_BF_AUDFS >> 8] &= ~GENMASK(3, 0);
++	im->mask[TFA_BF_AMPGAIN >> 8] &= ~GENMASK(12, 5);
++	im->mask[TFA_BF_I2CR >> 8] &= ~BIT(1);
++}
++
++/* compare the chip with the image; fix: rewrite the differing bits. Returns the number of differing registers. */
++static int tfa_image_check(struct tfa9878 *tfa, const struct tfa_image *im, bool fix, bool print)
++{
++	unsigned int reg, val;
++	int bad = 0;
++
++	for (reg = 0; reg < TFA_NREGS; reg++) {
++		if (!im->mask[reg])
++			continue;
++		if (regmap_read(tfa->regmap, reg, &val)) {
++			bad++;
++			continue;
++		}
++		if (((val ^ im->val[reg]) & im->mask[reg]) == 0)
++			continue;
++		bad++;
++		if (print)
++			pr_warn("tfa9878: reg 0x%02x reads 0x%04x, expected 0x%04x (mask 0x%04x)%s\n", reg, val,
++				im->val[reg], im->mask[reg], fix ? ": rewriting" : "");
++		if (fix)
++			regmap_update_bits(tfa->regmap, reg, im->mask[reg], im->val[reg]);
++	}
++	return bad;
++}
++
+ static int tfa9878_power_up_once(struct tfa9878 *tfa, int *errs)
+ {
+ 	struct regmap *map = tfa->regmap;
+@@ -198,39 +282,91 @@
+ 			audfs, gain);
+ 		return -EIO;
+ 	}
++
++	/* m52xq v258: the whole register image, not only the 3 bits above */
++	if (!err) {
++		struct tfa_image *im = kmalloc(sizeof(*im), GFP_KERNEL);
++
++		if (im) {
++			tfa_image_build(tfa, im);
++			if (tfa_image_check(tfa, im, true, true)) {
++				if (tfa_image_check(tfa, im, false, true))
++					err = -EIO;
++				else
++					pr_info("tfa9878: lost register writes repaired\n");
++			}
++			kfree(im);
++		}
++	}
+ #undef TFA_W
+ #undef TFA_B
+ 	return err;
+ }
+ 
+-static int tfa9878_power_up(struct tfa9878 *tfa)
+-{
+-	int attempt, errs = 0, ret = -EIO;
++/*
++ * m52xq v259 (2026-11-16): in a call the I2C bus of the amplifier (GPI DMA 900000) fails for ~50-100 ms while the ADSP brings
++ * the voice path up (20 GPI errors in 50 ms, every register read 0x0000) and the BCLK is not there yet: 4 tries 20 ms apart
++ * all fell into that window, m52xq-voicecall re-created the voice session twice and the sound came ~9 s late. Now: one try
++ * at once (fast path for media playback), then tries every TFA_RETRY_MS in a work until TFA_RETRIES are used up.
++ */
++#define TFA_RETRY_MS	100
++#define TFA_RETRIES	15
+ 
+-	for (attempt = 1; attempt <= TFA_POWERUP_TRIES; attempt++) {
+-		int e = 0;
++static void tfa9878_retry_work(struct work_struct *work)
++{
++	struct tfa9878 *tfa = container_of(to_delayed_work(work), struct tfa9878, retry_work);
++	int errs = 0, ret;
+ 
+-		ret = tfa9878_power_up_once(tfa, &e);
+-		errs += e;
+-		if (!ret) {
+-			if (attempt > 1)
+-				pr_info("tfa9878: power up ok after %d attempts (%d failed I2C transfers)\n", attempt, errs);
+-			tfa->on = true;
+-			return 0;
+-		}
+-		pr_warn("tfa9878: power up attempt %d of %d failed: %d (%d I2C errors)\n", attempt, TFA_POWERUP_TRIES, ret, e);
+-		msleep(20);
++	mutex_lock(&tfa->lock);
++	if (!tfa->wanted) {
++		mutex_unlock(&tfa->lock);
++		return;
++	}
++	tfa->retries_done++;
++	ret = tfa9878_power_up_once(tfa, &errs);
++	tfa->on = true;
++	if (!ret) {
++		pr_info("tfa9878: power up ok after %d background retries (%d ms)\n", tfa->retries_done,
++			tfa->retries_done * TFA_RETRY_MS);
++	} else if (--tfa->retries_left > 0) {
++		schedule_delayed_work(&tfa->retry_work, msecs_to_jiffies(TFA_RETRY_MS));
++	} else {
++		pr_err("tfa9878: power up FAILED after %d background retries: %d\n", tfa->retries_done, ret);
+ 	}
+-	/* leave the amplifier in the state of the last try: AMPE may be set, the gain control keeps working */
++	mutex_unlock(&tfa->lock);
++}
++
++static int tfa9878_power_up(struct tfa9878 *tfa)
++{
++	int errs = 0, ret;
++
++	mutex_lock(&tfa->lock);
++	tfa->wanted = true;
++	ret = tfa9878_power_up_once(tfa, &errs);
++	/* leave the amplifier in the state of the try: AMPE may be set, the gain control keeps working */
+ 	tfa->on = true;
+-	return ret;
++	if (ret) {
++		pr_warn("tfa9878: power up at once failed: %d (%d I2C errors), retrying every %d ms in the background\n",
++			ret, errs, TFA_RETRY_MS);
++		tfa->retries_left = TFA_RETRIES;
++		tfa->retries_done = 0;
++		schedule_delayed_work(&tfa->retry_work, msecs_to_jiffies(TFA_RETRY_MS));
++	}
++	mutex_unlock(&tfa->lock);
++	return 0;
+ }
+ 
+ static void tfa9878_power_down(struct tfa9878 *tfa)
+ {
++	mutex_lock(&tfa->lock);
++	tfa->wanted = false;
++	mutex_unlock(&tfa->lock);
++	cancel_delayed_work_sync(&tfa->retry_work);
++	mutex_lock(&tfa->lock);
+ 	tfa->on = false;
+ 	tfa_set_bf(tfa->regmap, TFA_BF_AMPE, 0);
+ 	tfa_set_bf(tfa->regmap, TFA_BF_PWDN, 1);
++	mutex_unlock(&tfa->lock);
+ }
+ 
+ static int tfa9878_amp_event(struct snd_soc_dapm_widget *w,
+@@ -374,6 +510,10 @@
+ 	tfa->rate = 48000;
+ 	tfa->slot_width = 16;
+ 	tfa->gain = TFA_AMPGAIN_DEFAULT;
++	mutex_init(&tfa->lock);
++	ret = devm_delayed_work_autocancel(dev, &tfa->retry_work, tfa9878_retry_work);
++	if (ret)
++		return ret;
+ 	tfa->regmap = devm_regmap_init_i2c(i2c, &tfa9878_regmap);
+ 	if (IS_ERR(tfa->regmap))
+ 		return PTR_ERR(tfa->regmap);
+diff -ruN a/sound/soc/qcom/qdsp6/q6cvp.c b/sound/soc/qcom/qdsp6/q6cvp.c
+--- a/sound/soc/qcom/qdsp6/q6cvp.c	2026-11-24 13:24:08.675725772 +0200
++++ b/sound/soc/qcom/qdsp6/q6cvp.c	2026-11-24 13:24:08.679725597 +0200
+@@ -170,6 +170,42 @@
+ }
+ EXPORT_SYMBOL_GPL(q6cvp_session_create);
+ 
++#define VSS_IVOCPROC_CMD_SET_DEVICE_V3			0x0001316A
++
++struct vss_ivocproc_cmd_set_device_cmd {
++	struct apr_hdr hdr;
++	u16 tx_port_id;
++	u32 tx_topology_id;
++	u16 rx_port_id;
++	u32 rx_topology_id;
++	u32 vocproc_mode;
++	u16 ec_ref_port_id;
++} __packed;
++
++/*
++ * m52xq: move a paused vocproc to other device ports (downstream voc_enable_device() ->
++ * voice_send_set_device_cmd(), V3 for CVD >= 2.2) instead of destroying and re-creating it:
++ * re-created vocprocs attached in the middle of a call crashed the ADSP audio PD while
++ * their calibration was sent (AfeDyb030, 3rd-4th session of a call).
++ */
++int q6cvp_set_device(struct q6voice_session *cvp, u16 tx_port, u16 rx_port)
++{
++	struct vss_ivocproc_cmd_set_device_cmd cmd;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.hdr.pkt_size = sizeof(cmd);
++	cmd.hdr.opcode = VSS_IVOCPROC_CMD_SET_DEVICE_V3;
++	cmd.tx_port_id = tx_port;
++	cmd.tx_topology_id = tx_topology;
++	cmd.rx_port_id = rx_port;
++	cmd.rx_topology_id = rx_topology;
++	cmd.vocproc_mode = vocproc_mode;
++	cmd.ec_ref_port_id = VSS_IVOCPROC_PORT_ID_NONE;
++
++	return q6voice_common_send(cvp, &cmd.hdr);
++}
++EXPORT_SYMBOL_GPL(q6cvp_set_device);
++
+ /*
+  * m52xq (SM7325, CVD 2.x): newer ADSP voice firmware needs the vocproc device
+  * media format and a topology commit after the session is created, and a
+diff -ruN a/sound/soc/qcom/qdsp6/q6cvp.h b/sound/soc/qcom/qdsp6/q6cvp.h
+--- a/sound/soc/qcom/qdsp6/q6cvp.h	2026-11-24 13:24:09.043709772 +0200
++++ b/sound/soc/qcom/qdsp6/q6cvp.h	2026-11-24 13:24:09.047709599 +0200
+@@ -9,6 +9,7 @@
+ struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
+ 					     u16 tx_port, u16 rx_port);
+ int q6cvp_enable(struct q6voice_session *cvp, bool enable);
++int q6cvp_set_device(struct q6voice_session *cvp, u16 tx_port, u16 rx_port);
+ int q6cvp_set_media(struct q6voice_session *cvp, u16 rx_port, unsigned int rx_ch,
+ 		    u16 tx_port, unsigned int tx_ch, unsigned int rate);
+ 
+diff -ruN a/sound/soc/qcom/qdsp6/q6mvm.c b/sound/soc/qcom/qdsp6/q6mvm.c
+--- a/sound/soc/qcom/qdsp6/q6mvm.c	2026-11-24 13:24:09.363695888 +0200
++++ b/sound/soc/qcom/qdsp6/q6mvm.c	2026-11-24 13:24:09.367695715 +0200
+@@ -140,6 +140,23 @@
+ }
+ EXPORT_SYMBOL_GPL(q6mvm_start);
+ 
++#define VSS_IMVM_CMD_PAUSE_VOICE			0x0001137D
++
++/*
++ * m52xq: pause the voice call for a device switch (downstream voc_disable_device() ->
++ * voice_pause_voice_call()); the attached vocprocs stop, the sessions stay.
++ */
++int q6mvm_pause(struct q6voice_session *mvm)
++{
++	struct apr_pkt cmd;
++
++	cmd.hdr.pkt_size = APR_HDR_SIZE;
++	cmd.hdr.opcode = VSS_IMVM_CMD_PAUSE_VOICE;
++
++	return q6voice_common_send(mvm, &cmd.hdr);
++}
++EXPORT_SYMBOL_GPL(q6mvm_pause);
++
+ static int q6mvm_probe(struct apr_device *adev)
+ {
+ 	int ret;
+diff -ruN a/sound/soc/qcom/qdsp6/q6mvm.h b/sound/soc/qcom/qdsp6/q6mvm.h
+--- a/sound/soc/qcom/qdsp6/q6mvm.h	2026-11-24 13:24:09.711680790 +0200
++++ b/sound/soc/qcom/qdsp6/q6mvm.h	2026-11-24 13:24:09.719680443 +0200
+@@ -11,5 +11,6 @@
+ int q6mvm_attach(struct q6voice_session *mvm, struct q6voice_session *cvp,
+ 		 bool state);
+ int q6mvm_start(struct q6voice_session *mvm, bool state);
++int q6mvm_pause(struct q6voice_session *mvm);
+ 
+ #endif /*_Q6_MVM_H */
+diff -ruN a/sound/soc/qcom/qdsp6/q6voice.c b/sound/soc/qcom/qdsp6/q6voice.c
+--- a/sound/soc/qcom/qdsp6/q6voice.c	2026-11-24 13:24:10.347653230 +0200
++++ b/sound/soc/qcom/qdsp6/q6voice.c	2026-11-24 13:24:10.351653057 +0200
+@@ -21,11 +21,16 @@
+ module_param(playback_uplink, bool, 0644);
+ MODULE_PARM_DESC(playback_uplink, "m52xq: feed the VOICE_PLAYBACK_TX pseudo port into the voice Tx stream during a call (USB headset microphone)");
+ 
++static bool device_switch = true;
++module_param(device_switch, bool, 0644);
++MODULE_PARM_DESC(device_switch, "m52xq: switch the Rx device of a running call in place (MVM pause, vocproc SET_DEVICE, start) instead of re-creating the voice sessions");
++
+ struct q6voice_path_runtime {
+ 	struct q6voice_session *sessions[Q6VOICE_SERVICE_COUNT];
+ 	unsigned int started;
+ 	bool recording;
+ 	bool playing;
++	bool paused;	/* m52xq: device switch in progress (MVM paused, Rx route removed) */
+ };
+ 
+ struct q6voice_path {
+@@ -162,7 +167,7 @@
+ 
+ 	mutex_lock(&p->lock);
+ 	if (!p->runtime) {
+-		p->runtime = kzalloc(sizeof(*p), GFP_KERNEL);
++		p->runtime = kzalloc(sizeof(*p->runtime), GFP_KERNEL);
+ 		if (!p->runtime) {
+ 			ret = -ENOMEM;
+ 			goto out;
+@@ -202,6 +207,8 @@
+ 
+ 	dev_dbg(dev, "stop path %d\n", p->type);
+ 
++	p->runtime->paused = false;
++
+ 	if (p->runtime->playing) {
+ 		ret = q6cvs_playback(p->runtime->sessions[Q6VOICE_SERVICE_CVS], false);
+ 		if (ret)
+@@ -341,6 +348,78 @@
+ }
+ EXPORT_SYMBOL_GPL(q6voice_set_port);
+ 
++/*
++ * m52xq: in-place device switch of a running call, as downstream msm-pcm-routing does:
++ * removing the Rx route of the running path pauses the call (voc_disable_device), routing
++ * it to the new (already started) backend moves the vocproc there with SET_DEVICE, sends
++ * media format, topology commit and calibration of the new device and starts the call
++ * again (voc_enable_device). Called by the Rx voice mixer controls.
++ */
++void q6voice_device_pause(struct q6voice *v, enum q6voice_path_type path)
++{
++	struct q6voice_path *p = &v->paths[path];
++	struct q6voice_session *mvm;
++	int ret;
++
++	if (!device_switch)
++		return;
++
++	mutex_lock(&p->lock);
++	if (!p->runtime || p->runtime->started != 3 || p->runtime->paused)
++		goto out;
++	mvm = p->runtime->sessions[Q6VOICE_SERVICE_MVM];
++	if (!mvm || !p->runtime->sessions[Q6VOICE_SERVICE_CVP])
++		goto out;
++
++	ret = q6mvm_pause(mvm);
++	if (ret)
++		dev_err(v->dev, "m52xq: voice device switch: pause failed: %d\n", ret);
++	p->runtime->paused = true;
++	dev_info(v->dev, "m52xq: voice device switch: paused (rx port %d)\n", p->rx_port);
++out:
++	mutex_unlock(&p->lock);
++}
++EXPORT_SYMBOL_GPL(q6voice_device_pause);
++
++void q6voice_device_resume(struct q6voice *v, enum q6voice_path_type path)
++{
++	struct q6voice_path *p = &v->paths[path];
++	struct q6voice_session *mvm, *cvp;
++	u16 tx_port, rx_port;
++	int ret;
++
++	mutex_lock(&p->lock);
++	if (!p->runtime || !p->runtime->paused || !p->rx_port)
++		goto out;
++	mvm = p->runtime->sessions[Q6VOICE_SERVICE_MVM];
++	cvp = p->runtime->sessions[Q6VOICE_SERVICE_CVP];
++	tx_port = q6afe_get_port_id(p->tx_port);
++	rx_port = q6afe_get_port_id(p->rx_port);
++
++	ret = q6cvp_set_device(cvp, tx_port, rx_port);
++	if (ret) {
++		dev_err(v->dev, "m52xq: voice device switch failed: set device %#x/%#x: %d\n",
++			tx_port, rx_port, ret);
++		goto start;
++	}
++	ret = q6cvp_set_media(cvp, rx_port, 2, tx_port, 2, 48000);
++	if (ret)
++		dev_err(v->dev, "m52xq: voice device switch failed: media format: %d\n", ret);
++start:
++	p->runtime->paused = false;
++	ret = q6mvm_start(mvm, true);
++	if (ret)
++		dev_err(v->dev, "m52xq: voice device switch failed: start: %d\n", ret);
++	if (q6cvp_dev_unmute_enabled()) {
++		q6cvp_set_mute(cvp, 0, false);
++		q6cvp_set_mute(cvp, 1, false);
++	}
++	dev_info(v->dev, "m52xq: voice device switch: running on rx port %#x\n", rx_port);
++out:
++	mutex_unlock(&p->lock);
++}
++EXPORT_SYMBOL_GPL(q6voice_device_resume);
++
+ MODULE_AUTHOR("Stephan Gerhold <stephan@gerhold.net>");
+ MODULE_DESCRIPTION("Q6Voice driver");
+ MODULE_LICENSE("GPL v2");
+diff -ruN a/sound/soc/qcom/qdsp6/q6voice-dai.c b/sound/soc/qcom/qdsp6/q6voice-dai.c
+--- a/sound/soc/qcom/qdsp6/q6voice-dai.c	2026-11-24 13:24:10.039666563 +0200
++++ b/sound/soc/qcom/qdsp6/q6voice-dai.c	2026-11-24 13:24:10.043666390 +0200
+@@ -108,12 +108,23 @@
+ 	bool val = !!ucontrol->value.integer.value[0];
+ 	bool capture = !!mc->shift;
+ 
++	/*
++	 * m52xq: Rx route of a running call removed -> pause the call before DPCM stops the old
++	 * backend; Rx route added -> DPCM starts the new backend in update_power, then the
++	 * vocproc moves there (no new voice sessions in the middle of the call).
++	 */
++	if (!capture && !val && q6voice_get_port(v, Q6VOICE_PATH_VOICE, capture) == mc->reg)
++		q6voice_device_pause(v, Q6VOICE_PATH_VOICE);
++
+ 	if (val)
+ 		q6voice_set_port(v, Q6VOICE_PATH_VOICE, capture, mc->reg);
+ 	else if (q6voice_get_port(v, Q6VOICE_PATH_VOICE, capture) == mc->reg)
+ 		q6voice_set_port(v, Q6VOICE_PATH_VOICE, capture, 0);
+ 
+ 	snd_soc_dapm_mixer_update_power(dapm, kcontrol, val, NULL);
++
++	if (!capture && val)
++		q6voice_device_resume(v, Q6VOICE_PATH_VOICE);
+ 	return 1;
+ }
+ 
+diff -ruN a/sound/soc/qcom/qdsp6/q6voice.h b/sound/soc/qcom/qdsp6/q6voice.h
+--- a/sound/soc/qcom/qdsp6/q6voice.h	2026-11-24 13:24:10.671639205 +0200
++++ b/sound/soc/qcom/qdsp6/q6voice.h	2026-11-24 13:24:10.675639032 +0200
+@@ -24,5 +24,7 @@
+ 		     bool capture);
+ void q6voice_set_port(struct q6voice *v, enum q6voice_path_type path,
+ 		      bool capture, int index);
++void q6voice_device_pause(struct q6voice *v, enum q6voice_path_type path);
++void q6voice_device_resume(struct q6voice *v, enum q6voice_path_type path);
+ 
+ #endif /*_Q6_VOICE_H */

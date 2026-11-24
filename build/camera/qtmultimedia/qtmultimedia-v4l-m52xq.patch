@@ -1,0 +1,2173 @@
+diff --git a/src/gsttools/qgstutils.cpp b/src/gsttools/qgstutils.cpp
+index 3512d168..ccdb2d3e 100644
+--- a/src/gsttools/qgstutils.cpp
++++ b/src/gsttools/qgstutils.cpp
+@@ -577,6 +577,94 @@ QVector<QGstUtils::CameraInfo> QGstUtils::enumerateCameras(GstElementFactory *fa
+             camerasCacheAgeTimer.restart();
+             return devices;
+         }
++
++        // A wrapper source whose inner element is libcamerasrc (selected through
++        // QT_GSTREAMER_CAMERABIN_VIDEOSRC): enumerate through libcamera's device
++        // provider instead of /dev/video*. The device name is libcamera's camera id,
++        // which libcamerasrc takes as "camera-name"; position and orientation come
++        // from the camera properties. Back cameras first so that index 0 is the
++        // default jolla-camera expects.
++        const QByteArray envVideoSource = qgetenv("QT_GSTREAMER_CAMERABIN_VIDEOSRC");
++        if (!envVideoSource.isEmpty() && !envVideoSource.contains('=')) {
++            if (GstElementFactory *inner = gst_element_factory_find(envVideoSource.constData())) {
++                // the registry hands out an unloaded stub: no GType until the plugin is loaded
++                GstPluginFeature *loaded = gst_plugin_feature_load(GST_PLUGIN_FEATURE(inner));
++                gst_object_unref(inner);
++                inner = loaded ? GST_ELEMENT_FACTORY(loaded) : 0;
++                const GType innerType = inner ? gst_element_factory_get_element_type(inner) : 0;
++                GObjectClass *innerClass = innerType ? static_cast<GObjectClass *>(g_type_class_ref(innerType)) : 0;
++                const bool byName = innerClass && g_object_class_find_property(innerClass, "camera-name");
++                if (innerClass)
++                    g_type_class_unref(innerClass);
++                if (inner)
++                    gst_object_unref(inner);
++
++                GstDeviceProvider *provider = byName
++                        ? gst_device_provider_factory_get_by_name("libcameraprovider")
++                        : 0;
++                if (provider) {
++                    QVector<CameraInfo> front;
++                    GList *list = gst_device_provider_get_devices(provider);
++                    for (GList *l = list; l; l = l->next) {
++                        GstDevice *device = GST_DEVICE(l->data);
++                        gchar *displayName = gst_device_get_display_name(device);
++                        GstStructure *props = gst_device_get_properties(device);
++                        gint location = -1;
++                        gint rotation = 0;
++                        if (props) {
++                            // enum properties are strings ("CameraLocationFront"), older
++                            // libcamera releases stored the plain integer
++                            if (const gchar *loc = gst_structure_get_string(props, "api.libcamera.Location"))
++                                // m52xq: libcamera 0.8 names them "Front" and "Back"
++                                location = !g_strcmp0(loc, "CameraLocationFront") || !g_strcmp0(loc, "Front") ? 0
++                                         : !g_strcmp0(loc, "CameraLocationBack") || !g_strcmp0(loc, "Back") ? 1 : 2;
++                            else
++                                gst_structure_get_int(props, "api.libcamera.Location", &location);
++                            gst_structure_get_int(props, "api.libcamera.Rotation", &rotation);
++                            gst_structure_free(props);
++                        }
++                        // libcamera's Rotation (the DT "rotation") is already
++                        // QCameraInfo::orientation. The (720 - x) above converts droidcamsrc's
++                        // Android angle, which counts the other way (libcamera's own Android
++                        // HAL reports 360 - Rotation).
++                        const CameraInfo info = {
++                                QString::fromUtf8(displayName),
++                                QString::fromUtf8(displayName),
++                                rotation % 360,
++                                location == 0 ? QCamera::FrontFace
++                                              : location == 1 ? QCamera::BackFace
++                                                              : QCamera::UnspecifiedPosition,
++                                QByteArray("libcamera")
++                        };
++                        if (info.position == QCamera::FrontFace)
++                            front.append(info);
++                        else
++                            devices.append(info);
++                        g_free(displayName);
++                    }
++                    g_list_free_full(list, reinterpret_cast<GDestroyNotify>(gst_object_unref));
++                    gst_object_unref(provider);
++
++                    // m52xq: libcamera lists the ultra wide camera first; the camera whose
++                    // id contains QT_GSTREAMER_CAMERA_FIRST becomes index 0 (the default)
++                    const QByteArray first = qgetenv("QT_GSTREAMER_CAMERA_FIRST");
++                    if (!first.isEmpty()) {
++                        for (int i = 1; i < devices.count(); ++i) {
++                            if (devices.at(i).name.contains(QString::fromUtf8(first))) {
++                                const CameraInfo info = devices.at(i);
++                                devices.remove(i);
++                                devices.prepend(info);
++                                break;
++                            }
++                        }
++                    }
++                    devices += front;
++
++                    camerasCacheAgeTimer.restart();
++                    return devices;
++                }
++            }
++        }
+     }
+ 
+ #ifdef USE_V4L
+diff --git a/src/gsttools/qgstvideorenderersink.cpp b/src/gsttools/qgstvideorenderersink.cpp
+index 31ac94e8..6b17280a 100644
+--- a/src/gsttools/qgstvideorenderersink.cpp
++++ b/src/gsttools/qgstvideorenderersink.cpp
+@@ -240,9 +240,12 @@ GstFlowReturn QVideoSurfaceGstDelegate::render(GstBuffer *buffer)
+     m_renderReturn = GST_FLOW_OK;
+     m_renderBuffer = buffer;
+ 
++    // A frame the GUI thread could not take within 300 ms is dropped, not fatal: with
++    // large software-rendered frames (libcamerasrc viewfinder) one slow frame used to end
++    // the whole stream with "Internal data stream error".
+     GstFlowReturn flowReturn = waitForAsyncEvent(&locker, &m_renderCondition, 300)
+                                                 ? m_renderReturn
+-                                                : GST_FLOW_ERROR;
++                                                : GST_FLOW_OK;
+ 
+     m_renderBuffer = 0;
+ 
+diff --git a/src/multimedia/qtmultimediaquicktools_headers/qdeclarativevideooutput_p.h b/src/multimedia/qtmultimediaquicktools_headers/qdeclarativevideooutput_p.h
+index 0f34cc03..d3980689 100644
+--- a/src/multimedia/qtmultimediaquicktools_headers/qdeclarativevideooutput_p.h
++++ b/src/multimedia/qtmultimediaquicktools_headers/qdeclarativevideooutput_p.h
+@@ -94,6 +94,10 @@ public:
+ 
+     int orientation() const;
+     void setOrientation(int);
++    // orientation() plus the rotation the source itself needs (see _q_updateCameraInfo)
++    int renderOrientation() const { return m_orientation + m_sourceOrientation; }
++    // the source needs a horizontal flip (front camera, see _q_updateCameraInfo)
++    bool sourceMirrored() const { return m_sourceMirrored; }
+ 
+     bool autoOrientation() const;
+     void setAutoOrientation(bool);
+@@ -143,6 +147,7 @@ private Q_SLOTS:
+ 
+ private:
+     bool createBackend(QMediaService *service);
++    void setSourceTransform(int orientation, bool mirrored);
+ 
+     static void filter_append(QQmlListProperty<QAbstractVideoFilter> *property, QAbstractVideoFilter *value);
+     static int filter_count(QQmlListProperty<QAbstractVideoFilter> *property);
+@@ -163,6 +168,8 @@ private:
+     QRectF m_lastRect;      // Cache of last rect to avoid recalculating geometry
+     QRectF m_contentRect;   // Destination pixel coordinates, unclipped
+     int m_orientation;
++    int m_sourceOrientation;
++    bool m_sourceMirrored;
+     bool m_autoOrientation;
+     QVideoOutputOrientationHandler *m_screenOrientationHandler;
+ 
+diff --git a/src/plugins/gstreamer/camerabin/camerabin.pro b/src/plugins/gstreamer/camerabin/camerabin.pro
+index 214489f3..8c88e622 100644
+--- a/src/plugins/gstreamer/camerabin/camerabin.pro
++++ b/src/plugins/gstreamer/camerabin/camerabin.pro
+@@ -1,6 +1,6 @@
+ TARGET = gstcamerabin
+ 
+-QT += multimedia-private
++QT += multimedia-private dbus
+ 
+ include(../common.pri)
+ 
+@@ -14,6 +14,8 @@ HEADERS += \
+     $$PWD/camerabinserviceplugin.h \
+     $$PWD/camerabinservice.h \
+     $$PWD/camerabinsession.h \
++    $$PWD/m52xqautofocus.h \
++    $$PWD/m52xqzoom.h \
+     $$PWD/camerabincontrol.h \
+     $$PWD/camerabinaudioencoder.h \
+     $$PWD/camerabinimageencoder.h \
+@@ -35,6 +37,8 @@ SOURCES += \
+     $$PWD/camerabinserviceplugin.cpp \
+     $$PWD/camerabinservice.cpp \
+     $$PWD/camerabinsession.cpp \
++    $$PWD/m52xqautofocus.cpp \
++    $$PWD/m52xqzoom.cpp \
+     $$PWD/camerabincontrol.cpp \
+     $$PWD/camerabinaudioencoder.cpp \
+     $$PWD/camerabincontainer.cpp \
+diff --git a/src/plugins/gstreamer/camerabin/camerabinexposure.cpp b/src/plugins/gstreamer/camerabin/camerabinexposure.cpp
+index a9e1d612..13a28439 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinexposure.cpp
++++ b/src/plugins/gstreamer/camerabin/camerabinexposure.cpp
+@@ -45,8 +45,13 @@ QT_BEGIN_NAMESPACE
+ 
+ CameraBinExposure::CameraBinExposure(CameraBinSession *session)
+     :QCameraExposureControl(session),
+-     m_session(session)
++     m_session(session),
++     m_libcamera(!session->photography())
+ {
++    if (m_libcamera)
++        connect(m_session, SIGNAL(statusChanged(QCamera::Status)),
++                this, SLOT(applyLibcameraValues(QCamera::Status)));
++
+     if (m_session->photography()) {
+         m_mappedExposureValues[GST_PHOTOGRAPHY_SCENE_MODE_MANUAL] = QCameraExposure::ExposureManual;
+         m_mappedExposureValues[GST_PHOTOGRAPHY_SCENE_MODE_AUTO] = QCameraExposure::ExposureAuto;
+@@ -81,6 +86,10 @@ CameraBinExposure::~CameraBinExposure()
+ 
+ bool CameraBinExposure::isParameterSupported(ExposureParameter parameter) const
+ {
++    if (m_libcamera)
++        return parameter == QCameraExposureControl::ExposureCompensation
++                || parameter == QCameraExposureControl::ISO;
++
+     switch (parameter) {
+     case QCameraExposureControl::ExposureCompensation:
+     case QCameraExposureControl::ISO:
+@@ -110,6 +119,10 @@ QVariantList CameraBinExposure::supportedParameterRange(ExposureParameter parame
+         res << -2.0 << 2.0;
+         break;
+     case QCameraExposureControl::ISO:
++        if (m_libcamera) {
++            res << 100 << 200 << 400 << 800 << 1600 << 3200;
++            break;
++        }
+ #ifdef HAVE_GST_PHOTOGRAPHY
+         if (G_IS_OBJECT(m_session->cameraSource()) &&
+                 G_IS_OBJECT_CLASS(G_OBJECT_GET_CLASS(G_OBJECT(m_session->cameraSource()))) &&
+@@ -174,6 +187,24 @@ QVariant CameraBinExposure::requestedValue(ExposureParameter parameter) const
+ 
+ QVariant CameraBinExposure::actualValue(ExposureParameter parameter) const
+ {
++    if (m_libcamera) {
++        if (parameter == QCameraExposureControl::ExposureCompensation)
++            return m_requestedValues.value(parameter, QVariant(0.0));
++        if (parameter == QCameraExposureControl::ISO) {
++            if (m_requestedValues.value(parameter).toInt() > 0)
++                return m_requestedValues.value(parameter);
++            gfloat gain = 0;
++            if (GstElement *source = libcameraSource())
++                g_object_get(G_OBJECT(source), "analogue-gain", &gain, NULL);
++            return gain > 0 ? QVariant(int(gain * 100 + 0.5)) : QVariant();
++        }
++        if (parameter == QCameraExposureControl::ExposureMode)
++            return QVariant::fromValue(QCameraExposure::ExposureAuto);
++        if (parameter == QCameraExposureControl::MeteringMode)
++            return QCameraExposure::MeteringMatrix;
++        return QVariant();
++    }
++
+     switch (parameter) {
+     case QCameraExposureControl::ExposureCompensation:
+     {
+@@ -264,6 +295,22 @@ bool CameraBinExposure::setValue(ExposureParameter parameter, const QVariant& va
+ {
+     QVariant oldValue = actualValue(parameter);
+ 
++    if (m_libcamera) {
++        if (parameter == QCameraExposureControl::ExposureMode)
++            return value.value<QCameraExposure::ExposureMode>() == QCameraExposure::ExposureAuto;
++        if (!isParameterSupported(parameter))
++            return false;
++        // an invalid value selects automatic ISO or no compensation
++        if (m_requestedValues.value(parameter) != value) {
++            m_requestedValues[parameter] = value;
++            emit requestedValueChanged(parameter);
++        }
++        setLibcameraValue(parameter, value);
++        if (actualValue(parameter) != oldValue)
++            emit actualValueChanged(parameter);
++        return true;
++    }
++
+     switch (parameter) {
+     case QCameraExposureControl::ExposureCompensation:
+         gst_photography_set_ev_compensation(m_session->photography(), value.toReal());
+@@ -377,4 +424,37 @@ bool CameraBinExposure::setValue(ExposureParameter parameter, const QVariant& va
+     return true;
+ }
+ 
++GstElement *CameraBinExposure::libcameraSource() const
++{
++    GstElement *source = m_session->videoSource();
++    return source && g_object_class_find_property(G_OBJECT_GET_CLASS(source), "analogue-gain-mode")
++            ? source : 0;
++}
++
++void CameraBinExposure::setLibcameraValue(ExposureParameter parameter, const QVariant &value)
++{
++    GstElement *source = libcameraSource();
++    if (!source)
++        return;     // applied when the camera becomes active
++
++    if (parameter == QCameraExposureControl::ISO) {
++        const int iso = value.toInt();
++        if (iso > 0)
++            g_object_set(G_OBJECT(source), "analogue-gain-mode", 1 /* manual */,
++                         "analogue-gain", gfloat(iso / 100.0), NULL);
++        else
++            g_object_set(G_OBJECT(source), "analogue-gain-mode", 0 /* auto */, NULL);
++    } else if (parameter == QCameraExposureControl::ExposureCompensation) {
++        g_object_set(G_OBJECT(source), "exposure-value", gfloat(value.toReal()), NULL);
++    }
++}
++
++void CameraBinExposure::applyLibcameraValues(QCamera::Status status)
++{
++    if (status != QCamera::ActiveStatus)
++        return;
++    for (auto it = m_requestedValues.constBegin(); it != m_requestedValues.constEnd(); ++it)
++        setLibcameraValue(it.key(), it.value());
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/gstreamer/camerabin/camerabinexposure.h b/src/plugins/gstreamer/camerabin/camerabinexposure.h
+index 4879dbff..08de291c 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinexposure.h
++++ b/src/plugins/gstreamer/camerabin/camerabinexposure.h
+@@ -63,8 +63,17 @@ public:
+     QVariant actualValue(ExposureParameter parameter) const;
+     bool setValue(ExposureParameter parameter, const QVariant& value);
+ 
++private Q_SLOTS:
++    void applyLibcameraValues(QCamera::Status status);
++
+ private:
++    // libcamerasrc has no GstPhotography: ISO is set as analogue gain (gain 1 = ISO 100)
++    // and the compensation as ExposureValue, both through the source's control properties
++    GstElement *libcameraSource() const;
++    void setLibcameraValue(ExposureParameter parameter, const QVariant &value);
++
+     CameraBinSession *m_session;
++    bool m_libcamera;
+     QHash<ExposureParameter, QVariant> m_requestedValues;
+ 
+ #ifdef HAVE_GST_PHOTOGRAPHY
+diff --git a/src/plugins/gstreamer/camerabin/camerabinflash.cpp b/src/plugins/gstreamer/camerabin/camerabinflash.cpp
+index f6221ae6..7be854d2 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinflash.cpp
++++ b/src/plugins/gstreamer/camerabin/camerabinflash.cpp
+@@ -32,10 +32,20 @@
+ ****************************************************************************/
+ 
+ #include "camerabinflash.h"
++#include <QFile>
++#include <QDir>
++#include <fcntl.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <linux/videodev2.h>
++#include <private/qgstutils_p.h>
+ #include "camerabinsession.h"
+ #include <gst/interfaces/photography.h>
+ 
+ #include <QDebug>
++#include <QDBusConnection>
++#include <QDBusMessage>
+ 
+ #if !GST_CHECK_VERSION(1,0,0)
+ typedef GstFlashMode GstPhotographyFlashMode;
+@@ -45,8 +55,20 @@ QT_BEGIN_NAMESPACE
+ 
+ CameraBinFlash::CameraBinFlash(CameraBinSession *session)
+     :QCameraFlashControl(session),
+-     m_session(session)
++     m_session(session),
++     m_ledBus(qgetenv("QT_GSTREAMER_CAMERA_FLASH_DBUS") == "1"),
++     m_ledMode(QCameraExposure::FlashOff),
++     m_ledOn(false)
+ {
++    // LED class names, comma separated, e.g. "white:flash-0"; brightness to switch them on
++    const QByteArray leds = qgetenv("QT_GSTREAMER_CAMERA_FLASH_LEDS");
++    for (const QByteArray &led : leds.split(','))
++        if (!led.trimmed().isEmpty())
++            m_leds << QString::fromLatin1(led.trimmed());
++    m_ledBrightness = qgetenv("QT_GSTREAMER_CAMERA_FLASH_BRIGHTNESS");
++    if (m_ledBrightness.isEmpty())
++        m_ledBrightness = "255";
++
+ #ifdef HAVE_GST_PHOTOGRAPHY
+     m_flashMap[GST_PHOTOGRAPHY_FLASH_MODE_AUTO] = QCameraExposure::FlashAuto;
+     m_flashMap[GST_PHOTOGRAPHY_FLASH_MODE_OFF] = QCameraExposure::FlashOff;
+@@ -58,10 +80,120 @@ CameraBinFlash::CameraBinFlash(CameraBinSession *session)
+ 
+ CameraBinFlash::~CameraBinFlash()
+ {
++    setLed(false);
++}
++
++bool CameraBinFlash::rearCamera() const
++{
++    return QGstUtils::cameraPosition(m_session->device(), m_session->sourceFactory())
++            != QCamera::FrontFace;
++}
++
++/*
++ * The LED's V4L2 flash subdevice (CONFIG_V4L2_FLASH_LED_CLASS): the sandboxed camera
++ * app cannot write /sys, but it can open /dev/v4l-subdev*. Torch mode at the highest
++ * torch intensity; the subdevice stays open while the LED is on.
++ */
++bool CameraBinFlash::setLedV4l2(const QString &led, bool on)
++{
++    if (!on) {
++        if (!m_ledFds.contains(led))
++            return false;
++        const int fd = m_ledFds.take(led);
++        struct v4l2_control ctrl = { V4L2_CID_FLASH_LED_MODE, V4L2_FLASH_LED_MODE_NONE };
++        ioctl(fd, VIDIOC_S_CTRL, &ctrl);
++        ::close(fd);
++        return true;
++    }
++
++    const QDir dir(QStringLiteral("/sys/class/video4linux"));
++    for (const QString &node : dir.entryList(QStringList(QStringLiteral("v4l-subdev*")))) {
++        QFile name(dir.filePath(node + QStringLiteral("/name")));
++        if (!name.open(QIODevice::ReadOnly) || QString::fromLatin1(name.readAll()).trimmed() != led)
++            continue;
++        const int fd = ::open(QFile::encodeName(QStringLiteral("/dev/") + node).constData(),
++                              O_RDWR | O_CLOEXEC);
++        if (fd < 0) {
++            qWarning("camerabin: cannot open %s for flash LED %s", qPrintable(node), qPrintable(led));
++            return false;
++        }
++        struct v4l2_queryctrl q;
++        memset(&q, 0, sizeof(q));
++        q.id = V4L2_CID_FLASH_TORCH_INTENSITY;
++        if (ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0) {
++            struct v4l2_control intensity = { V4L2_CID_FLASH_TORCH_INTENSITY, q.maximum };
++            ioctl(fd, VIDIOC_S_CTRL, &intensity);
++        }
++        struct v4l2_control ctrl = { V4L2_CID_FLASH_LED_MODE, V4L2_FLASH_LED_MODE_TORCH };
++        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
++            qWarning("camerabin: flash LED %s: torch mode failed", qPrintable(led));
++            ::close(fd);
++            return false;
++        }
++        m_ledFds.insert(led, fd);
++        return true;
++    }
++    return false;
++}
++
++void CameraBinFlash::setLed(bool on)
++{
++    if (on == m_ledOn)
++        return;
++    if (m_ledBus) {
++        QDBusMessage m = QDBusMessage::createMethodCall(QStringLiteral("org.sailfish.flashlight.provider"),
++                QStringLiteral("/org/sailfish/flashlight/provider"), QStringLiteral("org.sailfish.flashlight.provider"),
++                QStringLiteral("setFlashlight"));
++        m << on;
++        QDBusConnection::sessionBus().send(m);          // no wait: the pipeline is not to stall
++        m_ledOn = on;
++        return;
++    }
++    for (const QString &led : m_leds) {
++        if (setLedV4l2(led, on))
++            continue;
++        QFile f(QStringLiteral("/sys/class/leds/%1/brightness").arg(led));
++        if (!f.open(QIODevice::WriteOnly) || f.write(on ? m_ledBrightness : QByteArray("0")) < 0)
++            qWarning("camerabin: cannot switch flash LED %s: %s", qPrintable(led),
++                     qPrintable(f.errorString()));
++    }
++    m_ledOn = on;
++}
++
++/* m52xq: exposure at its maximum and a high analogue gain = a dark scene (main camera only; measured: 767..950 in a dim room) */
++bool CameraBinFlash::darkScene() const
++{
++    if (!m_session->device().contains(QLatin1String("s5kgw3")))
++        return false;
++    const QDir dir(QStringLiteral("/sys/class/video4linux"));
++    for (const QString &node : dir.entryList(QStringList(QStringLiteral("v4l-subdev*")))) {
++        QFile name(dir.filePath(node + QStringLiteral("/name")));
++        if (!name.open(QIODevice::ReadOnly) || !QString::fromLatin1(name.readAll()).startsWith(QLatin1String("s5kgw3")))
++            continue;
++        const int fd = ::open(QFile::encodeName(QStringLiteral("/dev/") + node).constData(), O_RDONLY | O_CLOEXEC);
++        if (fd < 0)
++            return false;
++        struct v4l2_control gain = { V4L2_CID_ANALOGUE_GAIN, 0 };
++        const bool ok = ioctl(fd, VIDIOC_G_CTRL, &gain) == 0;
++        ::close(fd);
++        return ok && gain.value >= 600;                 // 64 = 1x
++    }
++    return false;
++}
++
++bool CameraBinFlash::firesOnCapture() const
++{
++    if (!ledFlash() || m_session->captureMode() == QCamera::CaptureVideo || !rearCamera())
++        return false;
++    return m_ledMode.testFlag(QCameraExposure::FlashOn)
++            || (m_ledMode.testFlag(QCameraExposure::FlashAuto) && darkScene());
+ }
+ 
+ QCameraExposure::FlashModes CameraBinFlash::flashMode() const
+ {
++    if (ledFlash())
++        return m_ledMode;
++
+     GstPhotographyFlashMode flashMode;
+     gst_photography_get_flash_mode(m_session->photography(), &flashMode);
+ 
+@@ -87,6 +219,13 @@ QCameraExposure::FlashModes CameraBinFlash::flashMode() const
+ 
+ void CameraBinFlash::setFlashMode(QCameraExposure::FlashModes mode)
+ {
++    if (ledFlash()) {
++        m_ledMode = mode;
++        // torch: on while the mode is set (video light); flash: only around a capture
++        setLed(mode.testFlag(QCameraExposure::FlashTorch) && rearCamera());
++        return;
++    }
++
+     GstPhotographyFlashMode flashMode;
+     gst_photography_get_flash_mode(m_session->photography(), &flashMode);
+ 
+@@ -110,6 +249,17 @@ void CameraBinFlash::setFlashMode(QCameraExposure::FlashModes mode)
+ 
+ bool CameraBinFlash::isFlashModeSupported(QCameraExposure::FlashModes mode) const
+ {
++    if (ledFlash()) {
++        if (mode == QCameraExposure::FlashOff)
++            return true;
++        if (!rearCamera())
++            return false;
++        if (m_session->captureMode() == QCamera::CaptureVideo)
++            return mode == QCameraExposure::FlashTorch
++                    || mode == (QCameraExposure::FlashTorch | QCameraExposure::FlashOff);
++        return mode == QCameraExposure::FlashOn || mode == QCameraExposure::FlashAuto;
++    }
++
+ #ifdef HAVE_GST_PHOTOGRAPHY
+     if (G_IS_OBJECT(m_session->cameraSource()) &&
+             G_IS_OBJECT_CLASS(G_OBJECT_GET_CLASS(G_OBJECT(m_session->cameraSource()))) &&
+diff --git a/src/plugins/gstreamer/camerabin/camerabinflash.h b/src/plugins/gstreamer/camerabin/camerabinflash.h
+index b84b217c..4a33c038 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinflash.h
++++ b/src/plugins/gstreamer/camerabin/camerabinflash.h
+@@ -60,8 +60,25 @@ public:
+ 
+     bool isFlashReady() const;
+ 
++    /* Flash LED driven through the LED class (QT_GSTREAMER_CAMERA_FLASH_LEDS), for camera
++     * sources without GstPhotography (libcamerasrc). */
++    bool ledFlash() const { return !m_leds.isEmpty(); }
++    bool firesOnCapture() const;
++    void setLed(bool on);
++    bool darkScene() const;             // m52xq: flash "auto" (gain and exposure of the sensor)
++
+ private:
++    bool rearCamera() const;
++
+     CameraBinSession *m_session;
++    bool setLedV4l2(const QString &led, bool on);
++
++    QStringList m_leds;
++    QMap<QString, int> m_ledFds;     // open V4L2 flash subdevices while their LED is on
++    QByteArray m_ledBrightness;
++    bool m_ledBus;                      // m52xq: LED through org.sailfish.flashlight.provider (the sandbox cannot write /sys)
++    QCameraExposure::FlashModes m_ledMode;
++    bool m_ledOn;
+ 
+ #ifdef HAVE_GST_PHOTOGRAPHY
+     QMap<GstPhotographyFlashMode, QCameraExposure::FlashMode> m_flashMap;
+diff --git a/src/plugins/gstreamer/camerabin/camerabinfocus.cpp b/src/plugins/gstreamer/camerabin/camerabinfocus.cpp
+index c519b4a1..381abca5 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinfocus.cpp
++++ b/src/plugins/gstreamer/camerabin/camerabinfocus.cpp
+@@ -33,11 +33,13 @@
+ 
+ #include "camerabinfocus.h"
+ #include "camerabinsession.h"
++#include "camerabinflash.h"
+ 
+ #include <gst/interfaces/photography.h>
+ 
+ #include <QDebug>
+ #include <QtCore/qcoreevent.h>
++#include <QtCore/qhash.h>
+ #include <QtCore/qmetaobject.h>
+ 
+ #include <private/qgstutils_p.h>
+@@ -62,11 +64,20 @@ CameraBinFocus::CameraBinFocus(CameraBinSession *session)
+      m_focusStatus(QCamera::Unlocked),
+      m_focusZoneStatus(QCameraFocusZone::Selected),
+      m_focusPoint(0.5, 0.5),
+-     m_focusRect(0, 0, 0.3, 0.3)
++     m_focusRect(0, 0, 0.3, 0.3),
++     m_libcamera(!session->photography()),
++     m_lockPolls(0),
++     m_sawScanning(false),
++     m_assist(false),
++     m_windowToggle(false),
++     m_afTapPending(false)
+ {
+     m_focusRect.moveCenter(m_focusPoint);
+ 
+-    gst_photography_set_focus_mode(m_session->photography(), GST_PHOTOGRAPHY_FOCUS_MODE_AUTO);
++    if (m_libcamera)
++        m_focusMode = QCameraFocus::ContinuousFocus;
++    else
++        gst_photography_set_focus_mode(m_session->photography(), GST_PHOTOGRAPHY_FOCUS_MODE_AUTO);
+ 
+     connect(m_session, SIGNAL(statusChanged(QCamera::Status)),
+             this, SLOT(_q_handleCameraStatusChange(QCamera::Status)));
+@@ -95,6 +106,19 @@ QCameraFocus::FocusModes CameraBinFocus::focusMode() const
+ 
+ void CameraBinFocus::setFocusMode(QCameraFocus::FocusModes mode)
+ {
++    if (m_libcamera) {
++        // the scan runs continuously; auto only differs in that a lock rescans
++        if (isFocusModeSupported(mode) && m_focusMode != mode) {
++            m_focusMode = mode;
++            // AfModeAuto (1) holds a found focus, AfModeContinuous (2) follows the scene
++            if (GstElement *source = libcameraSource())
++                g_object_set(G_OBJECT(source), "af-mode",
++                             mode == QCameraFocus::AutoFocus ? 1 : 2, NULL);
++            emit focusModeChanged(m_focusMode);
++        }
++        return;
++    }
++
+     GstPhotographyFocusMode photographyMode;
+ 
+     switch (mode) {
+@@ -128,6 +152,9 @@ void CameraBinFocus::setFocusMode(QCameraFocus::FocusModes mode)
+ 
+ bool CameraBinFocus::isFocusModeSupported(QCameraFocus::FocusModes mode) const
+ {
++    if (m_libcamera)
++        return mode == QCameraFocus::AutoFocus || mode == QCameraFocus::ContinuousFocus;
++
+ #ifdef HAVE_GST_PHOTOGRAPHY
+     if (G_IS_OBJECT(m_session->cameraSource()) &&
+             G_IS_OBJECT_CLASS(G_OBJECT_GET_CLASS(G_OBJECT(m_session->cameraSource()))) &&
+@@ -247,6 +274,7 @@ QPointF CameraBinFocus::customFocusPoint() const
+ 
+ void CameraBinFocus::setCustomFocusPoint(const QPointF &point)
+ {
++    m_afTapPending = true;      // m52xq: the next lock request searches around this point
+     if (m_focusPoint != point) {
+         m_focusPoint = point;
+ 
+@@ -360,6 +388,7 @@ void CameraBinFocus::_q_handleCameraStatusChange(QCamera::Status status)
+ {
+     m_cameraStatus = status;
+     if (status == QCamera::ActiveStatus) {
++        m52xqAutofocus();       // first search at once, then it follows the scene
+         if (GstPad *pad = gst_element_get_static_pad(m_session->cameraSource(), "vfsrc")) {
+             if (GstCaps *caps = qt_gst_pad_get_current_caps(pad)) {
+                 if (GstStructure *structure = gst_caps_get_structure(caps, 0)) {
+@@ -385,16 +414,198 @@ void CameraBinFocus::_q_handleCameraStatusChange(QCamera::Status status)
+ 
+ void CameraBinFocus::_q_startFocusing()
+ {
++    if (m_libcamera) {
++        _q_setFocusStatus(QCamera::Searching, QCamera::UserRequest);
++        // m52xq: own contrast autofocus of the main camera (libcamera has none for the software ISP)
++        if (M52xqAf *af = m52xqAutofocus()) {
++            // a search only after a tap; the shutter button asks for a lock too and must keep the focus that is there
++            if (m_afTapPending) {
++                m_afTapPending = false;
++                m52xq_af_tap(af, m_focusRect.center().x(), m_focusRect.center().y());
++            }
++            m_lockPolls = 0;
++            m_lockTimer.start(100, this);
++            return;
++        }
++        m_lockPolls = 0;
++        m_sawScanning = false;
++        if (m_focusPointMode == QCameraFocus::FocusPointCustom
++                || m_focusMode == QCameraFocus::AutoFocus) {
++            // a changed window restarts the scan, also for a second tap on the same spot
++            m_windowToggle = !m_windowToggle;
++            setLibcameraWindow(m_focusPointMode == QCameraFocus::FocusPointCustom
++                               ? m_focusRect : QRectF(0.35, 0.35, 0.3, 0.3));
++            setFocusAssist(true);
++        } else {
++            // continuous focus has the scene in focus already unless a scan is running
++            m_sawScanning = true;
++        }
++        m_lockTimer.start(100, this);
++        return;
++    }
+     _q_setFocusStatus(QCamera::Searching, QCamera::UserRequest);
+     gst_photography_set_autofocus(m_session->photography(), TRUE);
+ }
+ 
+ void CameraBinFocus::_q_stopFocusing()
+ {
++    if (m_libcamera) {
++        m_lockTimer.stop();
++        setFocusAssist(false);
++        _q_setFocusStatus(QCamera::Unlocked, QCamera::UserRequest);
++        return;
++    }
+     gst_photography_set_autofocus(m_session->photography(), FALSE);
+     _q_setFocusStatus(QCamera::Unlocked, QCamera::UserRequest);
+ }
+ 
++// Pixel array active area of a libcamera camera, from the device provider's properties
++// (an array of rectangles flattened to x, y, width, height, ...); looked up once per camera
++static QRect libcameraActiveArea(const QString &device)
++{
++    static QHash<QString, QRect> areas;
++    if (areas.contains(device))
++        return areas.value(device);
++
++    QRect area;
++    if (GstDeviceProvider *provider = gst_device_provider_factory_get_by_name("libcameraprovider")) {
++        GList *list = gst_device_provider_get_devices(provider);
++        for (GList *l = list; l; l = l->next) {
++            GstDevice *gstDevice = GST_DEVICE(l->data);
++            gchar *name = gst_device_get_display_name(gstDevice);
++            GstStructure *props = gst_device_get_properties(gstDevice);
++            const GValue *value = props
++                    ? gst_structure_get_value(props, "api.libcamera.PixelArrayActiveAreas") : 0;
++            if (device == QString::fromUtf8(name) && value && GST_VALUE_HOLDS_ARRAY(value)
++                    && gst_value_array_get_size(value) >= 4) {
++                int a[4];
++                for (int k = 0; k < 4; ++k)
++                    a[k] = g_value_get_int(gst_value_array_get_value(value, k));
++                area = QRect(a[0], a[1], a[2], a[3]);
++            }
++            if (props)
++                gst_structure_free(props);
++            g_free(name);
++        }
++        g_list_free_full(list, reinterpret_cast<GDestroyNotify>(gst_object_unref));
++        gst_object_unref(provider);
++    }
++    areas.insert(device, area);
++    return area;
++}
++
++GstElement *CameraBinFocus::libcameraSource() const
++{
++    GstElement *source = m_session->videoSource();
++    return source && g_object_class_find_property(G_OBJECT_GET_CLASS(source), "af-windows")
++            ? source : 0;
++}
++
++void CameraBinFocus::setLibcameraWindow(const QRectF &rectangle)
++{
++    GstElement *source = libcameraSource();
++    if (!source || m_cameraStatus != QCamera::ActiveStatus)
++        return;
++
++    GValue windows = G_VALUE_INIT;
++    g_value_init(&windows, GST_TYPE_ARRAY);
++
++    // AfWindows are in pixel array coordinates. The software ISP's input frame shows
++    // the active area (binned), and the stream is a centred crop of that frame, so the
++    // frame is the smallest rectangle of the active area's shape around the viewfinder.
++    const QRect area = libcameraActiveArea(m_session->device());
++    const QSize view = m_viewfinderResolution;
++    if (!rectangle.isEmpty() && !area.isEmpty() && !view.isEmpty()) {
++        const qreal frameWidth = qMax<qreal>(view.width(),
++                                             qreal(view.height()) * area.width() / area.height());
++        const qreal frameHeight = frameWidth * area.height() / area.width();
++        const qreal scale = area.width() / frameWidth;
++        const int window[4] = {
++            int(area.x() + ((frameWidth - view.width()) / 2 + rectangle.x() * view.width()) * scale),
++            int(area.y() + ((frameHeight - view.height()) / 2 + rectangle.y() * view.height()) * scale),
++            int(rectangle.width() * view.width() * scale) + (m_windowToggle ? 8 : 0),
++            int(rectangle.height() * view.height() * scale)
++        };
++        GValue rect = G_VALUE_INIT;
++        g_value_init(&rect, GST_TYPE_ARRAY);
++        for (int value : window) {
++            GValue v = G_VALUE_INIT;
++            g_value_init(&v, G_TYPE_INT);
++            g_value_set_int(&v, value);
++            gst_value_array_append_and_take_value(&rect, &v);
++        }
++        gst_value_array_append_and_take_value(&windows, &rect);
++    }
++
++    g_object_set_property(G_OBJECT(source), "af-windows", &windows);
++    g_value_unset(&windows);
++}
++
++M52xqAf *CameraBinFocus::m52xqAutofocus() const
++{
++    // only the camera with the voice coil lens
++    return m_session->device().contains(QLatin1String("s5kgw3"))
++            ? m52xq_af_attach(m_session->videoSource()) : 0;
++}
++
++void CameraBinFocus::pollLibcameraFocus()
++{
++    if (M52xqAf *af = m52xqAutofocus()) {
++        ++m_lockPolls;
++        if (!m52xq_af_searching(af) || m_lockPolls >= 60) {     // 6 s
++            m_lockTimer.stop();
++            const bool ok = !m52xq_af_searching(af);
++            _q_setFocusStatus(ok ? QCamera::Locked : QCamera::Unlocked,
++                              ok ? QCamera::LockAcquired : QCamera::LockFailed);
++        }
++        return;
++    }
++
++    GstElement *source = libcameraSource();
++    gint state = 0;     // AfStateIdle, Scanning, Focused, Failed
++    // without the af-state property (plain libcamera) there is nothing to wait for
++    if (source && g_object_class_find_property(G_OBJECT_GET_CLASS(source), "af-state"))
++        g_object_get(G_OBJECT(source), "af-state", &state, NULL);
++    else
++        source = 0;
++
++    // the last report can predate the restart: wait to see the new scan first
++    if (state == 1)
++        m_sawScanning = true;
++    ++m_lockPolls;
++
++    QCamera::LockStatus status = QCamera::Searching;
++    if (!source || (m_sawScanning && state == 2) || (m_lockPolls >= 5 && state == 0))
++        status = QCamera::Locked;
++    else if (m_lockPolls >= 80)     // 8 s
++        status = QCamera::Unlocked;
++    else if (!m_sawScanning && m_lockPolls >= 10 && state == 2)
++        status = QCamera::Locked;   // the scan finished between two polls
++
++    if (status != QCamera::Searching) {
++        m_lockTimer.stop();
++        setFocusAssist(false);
++        _q_setFocusStatus(status, status == QCamera::Locked ? QCamera::LockAcquired
++                                                             : QCamera::LockFailed);
++    }
++}
++
++void CameraBinFocus::setFocusAssist(bool on)
++{
++    CameraBinFlash *flash = m_session->cameraFlashControl();
++    if (!flash || !flash->ledFlash())
++        return;
++    if (on && flash->firesOnCapture()) {
++        flash->setLed(true);
++        m_assist = true;
++    } else if (!on && m_assist) {
++        // the capture switches the LED on again for its flash
++        if (!flash->flashMode().testFlag(QCameraExposure::FlashTorch))
++            flash->setLed(false);
++        m_assist = false;
++    }
++}
++
+ void CameraBinFocus::setViewfinderResolution(const QSize &resolution)
+ {
+     if (resolution != m_viewfinderResolution) {
+@@ -455,6 +666,19 @@ void CameraBinFocus::updateRegionOfInterest(const QVector<QRect> &rectangles)
+     if (m_cameraStatus != QCamera::ActiveStatus)
+         return;
+ 
++    if (m_libcamera) {
++        if (rectangles.isEmpty() || m_viewfinderResolution.isEmpty()) {
++            setLibcameraWindow(QRectF());
++        } else {
++            const QRect r = rectangles.first();
++            setLibcameraWindow(QRectF(qreal(r.x()) / m_viewfinderResolution.width(),
++                                      qreal(r.y()) / m_viewfinderResolution.height(),
++                                      qreal(r.width()) / m_viewfinderResolution.width(),
++                                      qreal(r.height()) / m_viewfinderResolution.height()));
++        }
++        return;
++    }
++
+     GstElement * const cameraSource = m_session->cameraSource();
+     if (!cameraSource)
+         return;
+@@ -523,7 +747,9 @@ void CameraBinFocus::_q_updateFaces()
+ 
+ void CameraBinFocus::timerEvent(QTimerEvent *event)
+ {
+-    if (event->timerId() == m_faceResetTimer.timerId()) {
++    if (event->timerId() == m_lockTimer.timerId()) {
++        pollLibcameraFocus();
++    } else if (event->timerId() == m_faceResetTimer.timerId()) {
+         m_faceResetTimer.stop();
+ 
+         if (m_focusStatus == QCamera::Unlocked) {
+diff --git a/src/plugins/gstreamer/camerabin/camerabinfocus.h b/src/plugins/gstreamer/camerabin/camerabinfocus.h
+index d193edf1..d985a508 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinfocus.h
++++ b/src/plugins/gstreamer/camerabin/camerabinfocus.h
+@@ -52,6 +52,8 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++#include "m52xqautofocus.h"
++
+ class CameraBinSession;
+ 
+ class CameraBinFocus
+@@ -104,6 +106,14 @@ private Q_SLOTS:
+ #endif
+ 
+ private:
++    // libcamerasrc has no GstPhotography: the software ISP focuses on af-windows
++    // and reports af-state, which a timer polls while a lock is searched
++    GstElement *libcameraSource() const;
++    M52xqAf *m52xqAutofocus() const;
++    void setLibcameraWindow(const QRectF &rectangle);
++    void pollLibcameraFocus();
++    void setFocusAssist(bool on);
++
+     void resetFocusPoint();
+     void updateRegionOfInterest(const QRectF &rectangle);
+     void updateRegionOfInterest(const QVector<QRect> &rectangles);
+@@ -125,6 +135,13 @@ private:
+     QVector<QRect> m_faceFocusRects;
+     QBasicTimer m_faceResetTimer;
+     mutable QMutex m_mutex;
++    bool m_libcamera;
++    QBasicTimer m_lockTimer;
++    int m_lockPolls;
++    bool m_sawScanning;
++    bool m_assist;
++    bool m_windowToggle;
++    bool m_afTapPending;
+ #ifdef HAVE_GST_PHOTOGRAPHY
+     QMap<GstPhotographyFocusMode, QCameraFocus::FocusMode> m_focusMap;
+ #endif
+diff --git a/src/plugins/gstreamer/camerabin/camerabinimagecapture.cpp b/src/plugins/gstreamer/camerabin/camerabinimagecapture.cpp
+index 348cda98..2e424da7 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinimagecapture.cpp
++++ b/src/plugins/gstreamer/camerabin/camerabinimagecapture.cpp
+@@ -31,6 +31,7 @@
+ **
+ ****************************************************************************/
+ 
++#include <QtCore/qfileinfo.h>
+ #include "camerabinimagecapture.h"
+ #include "camerabincontrol.h"
+ #include "camerabincapturedestination.h"
+@@ -41,6 +42,18 @@
+ #include <private/qvideosurfacegstsink_p.h>
+ #include <private/qgstutils_p.h>
+ #include <QtMultimedia/qmediametadata.h>
++#include <QTimer>
++#ifdef HAVE_GST_PHOTOGRAPHY
++#include "camerabinflash.h"
++#endif
++
++// With an LED flash (no GstPhotography): the LED goes on this long before the capture, so
++// the software auto exposure has adapted when the frame is taken.
++#define LED_PREFLASH_MS 1000        // m52xq: the exposure loop needs about a second to settle
++#define LED_FLASH_TIMEOUT_MS 3000
++#include <QtCore/qpointer.h>
++#include <QtCore/qtimer.h>
++#include <QtCore/qfile.h>
+ #include <QtCore/qdebug.h>
+ #include <QtCore/qbuffer.h>
+ #include <QtGui/qimagereader.h>
+@@ -60,6 +73,9 @@ CameraBinImageCapture::CameraBinImageCapture(CameraBinSession *session)
+     , m_metadataMuxerElement(0)
+     , m_requestId(0)
+     , m_ready(false)
++    , m_rawProcess(0)
++    , m_rawCaptured(false)
++    , m_flashPending(false)
+ {
+     connect(m_session, SIGNAL(statusChanged(QCamera::Status)), SLOT(updateState()));
+     connect(m_session, SIGNAL(imageExposed(int)), this, SIGNAL(imageExposed(int)));
+@@ -68,6 +84,17 @@ CameraBinImageCapture::CameraBinImageCapture(CameraBinSession *session)
+     connect(m_session, SIGNAL(handleReadyForCaptureChanged(bool)), this, SLOT(updateState()));
+ 
+     m_session->bus()->installMessageFilter(this);
++
++#ifdef HAVE_GST_PHOTOGRAPHY
++    // the LED flash goes off once the frame is taken (or the capture failed)
++    auto ledOff = [this]() {
++        if (CameraBinFlash *flash = m_session->cameraFlashControl())
++            if (flash->ledFlash() && !flash->flashMode().testFlag(QCameraExposure::FlashTorch))
++                flash->setLed(false);
++    };
++    connect(m_session, &CameraBinSession::imageCaptured, this, ledOff);
++    connect(this, &CameraBinImageCapture::error, this, ledOff);
++#endif
+ }
+ 
+ CameraBinImageCapture::~CameraBinImageCapture()
+@@ -90,11 +117,116 @@ int CameraBinImageCapture::capture(const QString &fileName)
+ 
+ #ifdef DEBUG_CAPTURE
+     qDebug() << Q_FUNC_INFO << m_requestId << fileName;
++#endif
++    const bool raw = !m_rawProcess && m_session->rawPhotoPossible()
++            && (m_session->captureDestinationControl()->captureDestination() & QCameraImageCapture::CaptureToFile);
++    CameraBinFlash *flash = m_session->cameraFlashControl();
++    if (raw) {
++        if (flash && flash->firesOnCapture()) {
++            m_flashPending = true;
++            flash->setLed(true);
++            updateState();
++            QTimer::singleShot(LED_PREFLASH_MS, this, [this, fileName]() {
++                m_flashPending = false;
++                if (!m_rawProcess && m_session->status() == QCamera::ActiveStatus) {
++                    captureRaw(fileName);
++                } else {
++                    flashOff();
++                    updateState();
++                    emit error(m_requestId, QCameraImageCapture::NotReadyError, tr("Camera not ready"));
++                }
++            });
++            return m_requestId;
++        }
++        captureRaw(fileName);
++        return m_requestId;
++    }
++#ifdef HAVE_GST_PHOTOGRAPHY
++    if (flash && flash->firesOnCapture()) {
++        const int id = m_requestId;
++        flash->setLed(true);
++        QTimer::singleShot(LED_PREFLASH_MS, this, [this, id, fileName]() {
++            m_session->captureImage(id, fileName);
++        });
++        QTimer::singleShot(LED_FLASH_TIMEOUT_MS, this, [this]() {
++            if (CameraBinFlash *flash = m_session->cameraFlashControl())
++                if (!flash->flashMode().testFlag(QCameraExposure::FlashTorch))
++                    flash->setLed(false);
++        });
++        return m_requestId;
++    }
+ #endif
+     m_session->captureImage(m_requestId, fileName);
+     return m_requestId;
+ }
+ 
++// m52xq: 64 MP (main) / 32 MP (front) photo. The pipeline gives the camera back, the helper captures one raw frame, prints
++// M52XQ_CAPTURED (the viewfinder starts again) and develops the JPEG on the GPU.
++void CameraBinImageCapture::captureRaw(const QString &fileName)
++{
++    const int id = m_requestId;
++    const QString file = m_session->rawPhotoFileName(fileName);
++    // written under a temporary name: the gallery opened the file while it was still being written
++    const QString part = QFileInfo(file).path() + QLatin1String("/.") + QFileInfo(file).fileName() + QLatin1String(".part");
++    const bool front = m_session->device().contains(QLatin1String("imx616"));
++    const int orientation = m_session->rawPhotoExifOrientation();
++
++    m_rawCaptured = false;
++    m_rawProcess = new QProcess(this);
++    m_rawProcess->setProcessChannelMode(QProcess::SeparateChannels);
++    updateState();
++    m_session->beginRawPhoto();
++
++    connect(m_rawProcess, &QProcess::readyReadStandardOutput, this, [this, id]() {
++        if (!m_rawCaptured && m_rawProcess->readAllStandardOutput().contains("M52XQ_CAPTURED")) {
++            m_rawCaptured = true;
++            emit imageExposed(id);
++            m_session->endRawPhoto();
++        }
++    });
++    connect(m_rawProcess, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished), this,
++            [this, id, file, part](int code, QProcess::ExitStatus status) {
++        const QByteArray log = m_rawProcess->readAllStandardError().trimmed();
++        m_rawProcess->deleteLater();
++        m_rawProcess = 0;
++        flashOff();
++        m_session->endRawPhoto();       // when the capture itself failed
++        if (status == QProcess::NormalExit && code == 0 && QFile::exists(part) && QFile::rename(part, file)) {
++            emit imageSaved(id, file);
++        } else {
++            QFile::remove(part);
++            qWarning() << "m52xq-rawphoto failed:" << code << log.right(300);
++            emit error(id, QCameraImageCapture::ResourceError, tr("Camera error"));
++        }
++        updateState();
++    });
++    connect(m_rawProcess, &QProcess::errorOccurred, this, [this, id](QProcess::ProcessError e) {
++        if (e == QProcess::FailedToStart && m_rawProcess) {
++            m_rawProcess->deleteLater();
++            m_rawProcess = 0;
++            m_session->endRawPhoto();
++            flashOff();
++            emit error(id, QCameraImageCapture::ResourceError, tr("Camera error"));
++            updateState();
++        }
++    });
++    connect(this, &CameraBinImageCapture::imageExposed, m_rawProcess, [this, id](int exposed) { if (exposed == id) flashOff(); });
++    QPointer<QProcess> guard(m_rawProcess);
++    QTimer::singleShot(25000, this, [guard]() { if (guard) guard->kill(); });
++
++    m_rawProcess->start(CameraBinSession::rawPhotoHelper(),
++                        QStringList() << QStringLiteral("--camera") << (front ? QStringLiteral("front") : QStringLiteral("main"))
++                                      << QStringLiteral("--out") << part
++                                      << QStringLiteral("--orientation") << QString::number(orientation));
++}
++
++void CameraBinImageCapture::flashOff()
++{
++    CameraBinFlash *flash = m_session->cameraFlashControl();
++    if (flash && flash->ledFlash() && !flash->flashMode().testFlag(QCameraExposure::FlashTorch))
++        flash->setLed(false);
++}
++
+ void CameraBinImageCapture::cancelCapture()
+ {
+ }
+@@ -103,7 +235,8 @@ void CameraBinImageCapture::updateState()
+ {
+     bool ready = m_session->status() == QCamera::ActiveStatus
+             && m_session->resourcePolicy()->canCapture()
+-            && m_session->isReadyForCapture();
++            && m_session->isReadyForCapture()
++            && !m_rawProcess && !m_flashPending && !m_session->inRawPhoto();
+     if (m_ready != ready) {
+ #ifdef DEBUG_CAPTURE
+         qDebug() << "readyForCaptureChanged" << ready;
+@@ -184,6 +317,12 @@ bool CameraBinImageCapture::EncoderProbe::probeBuffer(GstBuffer *buffer)
+     qDebug() << "Uncompressed buffer probe";
+ #endif
+ 
++    // m52xq: droidcamsrc reports the exposure itself ("photo-capture-start"), libcamerasrc does not: the frame that goes to the
++    // encoder is the exposed one (shutter sound and animation of jolla-camera)
++    if (!session->photography())
++        QMetaObject::invokeMethod(capture, "imageExposed", Qt::QueuedConnection,
++                                  Q_ARG(int, capture->m_requestId));
++
+     QCameraImageCapture::CaptureDestinations destination =
+             session->captureDestinationControl()->captureDestination();
+     QVideoFrame::PixelFormat format = session->captureBufferFormatControl()->bufferFormat();
+diff --git a/src/plugins/gstreamer/camerabin/camerabinimagecapture.h b/src/plugins/gstreamer/camerabin/camerabinimagecapture.h
+index 12d9d4ce..3f63003e 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinimagecapture.h
++++ b/src/plugins/gstreamer/camerabin/camerabinimagecapture.h
+@@ -35,6 +35,7 @@
+ #ifndef CAMERABINIMAGECAPTURECONTROL_H
+ #define CAMERABINIMAGECAPTURECONTROL_H
+ 
++#include <QtCore/qprocess.h>
+ #include <qcameraimagecapturecontrol.h>
+ #include "camerabinsession.h"
+ 
+@@ -62,6 +63,8 @@ public:
+     bool isReadyForCapture() const;
+     int capture(const QString &fileName);
+     void cancelCapture();
++    void captureRaw(const QString &fileName);
++    void flashOff();
+ 
+     bool processBusMessage(const QGstreamerMessage &message);
+ 
+@@ -110,6 +113,9 @@ private:
+ #endif
+     int m_requestId;
+     bool m_ready;
++    QProcess *m_rawProcess;
++    bool m_rawCaptured;
++    bool m_flashPending;        // m52xq: the LED is on, the capture starts in a moment
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/gstreamer/camerabin/camerabinsession.cpp b/src/plugins/gstreamer/camerabin/camerabinsession.cpp
+index cbf9feb4..ce3c3117 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinsession.cpp
++++ b/src/plugins/gstreamer/camerabin/camerabinsession.cpp
+@@ -30,6 +30,7 @@
+ ** $QT_END_LICENSE$
+ **
+ ****************************************************************************/
++#include "m52xqzoom.h"
+ #include "camerabinsession.h"
+ #include "camerabincontrol.h"
+ #include "camerabinrecorder.h"
+@@ -64,8 +65,10 @@
+ #include <gst/gsttagsetter.h>
+ #include <gst/gstversion.h>
+ 
++#include <QtCore/qfile.h>
+ #include <QtCore/qdebug.h>
+ #include <QCoreApplication>
++#include <QtCore/qmap.h>
+ #include <QtCore/qmetaobject.h>
+ #include <QtGui/qdesktopservices.h>
+ 
+@@ -121,6 +124,8 @@ CameraBinSession::CameraBinSession(GstElementFactory *sourceFactory, QObject *pa
+      m_captureMode(QCamera::CaptureStillImage),
+      m_appliedCaptureMode(QCamera::CaptureStillImage),
+      m_busy(false),
++     m_rawPhoto(false),
++     m_rawPhotoRestart(false),
+      m_reportedReadyForCapture(false),
+      m_audioInputFactory(0),
+      m_videoInputFactory(0),
+@@ -216,6 +221,14 @@ CameraBinSession::~CameraBinSession()
+ }
+ 
+ #ifdef HAVE_GST_PHOTOGRAPHY
++// The wrapper source holds libcamerasrc (QT_GSTREAMER_CAMERABIN_VIDEOSRC): focus, locks
++// and exposure then work through its control properties instead of GstPhotography
++bool CameraBinSession::libcameraSource() const
++{
++    static const bool libcamera = qgetenv("QT_GSTREAMER_CAMERABIN_VIDEOSRC").startsWith("libcamerasrc");
++    return libcamera;
++}
++
+ GstPhotography *CameraBinSession::photography()
+ {
+     if (GST_IS_PHOTOGRAPHY(m_camerabin)) {
+@@ -232,28 +245,28 @@ GstPhotography *CameraBinSession::photography()
+ 
+ CameraBinExposure *CameraBinSession::cameraExposureControl()
+ {
+-    if (!m_cameraExposureControl && photography())
++    if (!m_cameraExposureControl && (photography() || libcameraSource()))
+         m_cameraExposureControl = new CameraBinExposure(this);
+     return m_cameraExposureControl;
+ }
+ 
+ CameraBinFlash *CameraBinSession::cameraFlashControl()
+ {
+-    if (!m_cameraFlashControl && photography())
++    if (!m_cameraFlashControl && (photography() || !qgetenv("QT_GSTREAMER_CAMERA_FLASH_LEDS").isEmpty()))
+         m_cameraFlashControl = new CameraBinFlash(this);
+     return m_cameraFlashControl;
+ }
+ 
+ CameraBinFocus *CameraBinSession::cameraFocusControl()
+ {
+-    if (!m_cameraFocusControl && photography())
++    if (!m_cameraFocusControl && (photography() || libcameraSource()))
+         m_cameraFocusControl = new CameraBinFocus(this);
+     return m_cameraFocusControl;
+ }
+ 
+ CameraBinLocks *CameraBinSession::cameraLocksControl()
+ {
+-    if (!m_cameraLocksControl && photography())
++    if (!m_cameraLocksControl && (photography() || libcameraSource()))
+         m_cameraLocksControl = new CameraBinLocks(this);
+     return m_cameraLocksControl;
+ }
+@@ -340,7 +353,15 @@ void CameraBinSession::setupCaptureResolution()
+     // If capture resolution is specified, use it also for the viewfinder to avoid caps negotiation
+     // to fail.
+     if (m_usingWrapperCameraBinSrc) {
+-        if (m_captureMode == QCamera::CaptureStillImage && !imageResolution.isEmpty())
++        // libcamerasrc renegotiates by restarting the camera in the same sensor mode, so
++        // the viewfinder can stay small (smooth, faster autofocus) and only the captured
++        // frame comes at the image resolution. QT_GSTREAMER_LIBCAMERA_FULL_VIEWFINDER=1
++        // keeps the viewfinder at the image resolution.
++        static const bool fullViewfinder = qgetenv("QT_GSTREAMER_LIBCAMERA_FULL_VIEWFINDER") == "1";
++        const bool smallViewfinder = libcameraSource() && !fullViewfinder
++                && !viewfinderResolution.isEmpty();
++        if (m_captureMode == QCamera::CaptureStillImage && !imageResolution.isEmpty()
++                && !smallViewfinder)
+             viewfinderResolution = imageResolution;
+         else if (m_captureMode == QCamera::CaptureVideo && !videoResolution.isEmpty())
+             viewfinderResolution = videoResolution;
+@@ -532,8 +553,12 @@ GstElement *CameraBinSession::buildCameraSource()
+                     g_object_set(G_OBJECT(m_cameraSrc), "video-source", m_videoSrc, NULL);
+             }
+ 
+-            if (m_videoSrc)
+-                g_object_set(G_OBJECT(m_videoSrc), "device", m_inputDevice.toUtf8().constData(), NULL);
++            if (m_videoSrc) {
++                // libcamerasrc selects its camera by id ("camera-name"), v4l2src by node ("device").
++                const char *deviceProperty = g_object_class_find_property(G_OBJECT_GET_CLASS(m_videoSrc), "camera-name")
++                        ? "camera-name" : "device";
++                g_object_set(G_OBJECT(m_videoSrc), deviceProperty, m_inputDevice.toUtf8().constData(), NULL);
++            }
+ 
+         } else if (g_object_class_find_property(G_OBJECT_GET_CLASS(m_cameraSrc), "camera-device")) {
+             g_object_set(G_OBJECT(m_cameraSrc), "camera-device", m_inputDevice.toInt(), NULL);
+@@ -543,7 +568,10 @@ GstElement *CameraBinSession::buildCameraSource()
+     if (m_cameraSrc != camSrc) {
+         g_object_set(G_OBJECT(m_camerabin), CAMERA_SOURCE_PROPERTY, m_cameraSrc, NULL);
+         g_signal_connect(G_OBJECT(m_cameraSrc), "notify::ready-for-capture", G_CALLBACK(updateReadyForCapture), this);
+-
++        // Take the initial value too: a source that is ready from the start and never
++        // toggles (wrappercamerabinsrc around libcamerasrc) emits no notify, and capture
++        // would stay disabled.
++        updateReadyForCapture(G_OBJECT(m_cameraSrc), 0, this);
+     }
+ 
+     if (camSrc)
+@@ -552,6 +580,57 @@ GstElement *CameraBinSession::buildCameraSource()
+     return m_cameraSrc;
+ }
+ 
++QString CameraBinSession::rawPhotoHelper()
++{
++    return QStringLiteral("/usr/lib64/m52xq/m52xq-rawphoto");
++}
++
++bool CameraBinSession::rawPhotoPossible() const
++{
++    return libcameraSource()
++            && (m_inputDevice.contains(QLatin1String("s5kgw3")) || m_inputDevice.contains(QLatin1String("imx616")))
++            && m_captureMode == QCamera::CaptureStillImage
++            && m52xq_zoom_get() < 1.01      // the helper does not zoom: the zoomed photo goes the normal way
++            && qgetenv("M52XQ_RAWPHOTO") != "0"
++            && QFile::exists(rawPhotoHelper());
++}
++
++QString CameraBinSession::rawPhotoFileName(const QString &fileName)
++{
++    m_imageFileName = m_mediaStorageLocation.generateFileName(fileName, QMediaStorageLocation::Pictures,
++                                                              QLatin1String("IMG_"), QLatin1String("jpg"));
++    return m_imageFileName;
++}
++
++int CameraBinSession::rawPhotoExifOrientation() const
++{
++    const QString tag = m_metaData.value("image-orientation").toString();
++    return tag == QLatin1String("rotate-90") ? 6 : tag == QLatin1String("rotate-180") ? 3
++            : tag == QLatin1String("rotate-270") ? 8 : 1;
++}
++
++void CameraBinSession::beginRawPhoto()
++{
++    m_rawPhoto = true;
++    m_rawPhotoRestart = false;
++    // NULL, not READY: libcamerasrc gives the camera back only there
++    gst_element_set_state(m_camerabin, GST_STATE_NULL);
++}
++
++void CameraBinSession::endRawPhoto()
++{
++    if (!m_rawPhoto)
++        return;
++    // the application may have left the camera meanwhile
++    if (m_status != QCamera::ActiveStatus || !m_camerabin) {
++        m_rawPhoto = false;
++        return;
++    }
++    m_rawPhotoRestart = true;
++    setupCaptureResolution();
++    gst_element_set_state(m_camerabin, GST_STATE_PLAYING);
++}
++
+ void CameraBinSession::captureImage(int requestId, const QString &fileName)
+ {
+     const QString actualFileName = m_mediaStorageLocation.generateFileName(fileName,
+@@ -1167,6 +1246,17 @@ bool CameraBinSession::processBusMessage(const QGstreamerMessage &message)
+                     GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS(GST_BIN(m_camerabin), GST_DEBUG_GRAPH_SHOW_ALL, "camerabin");
+ #endif
+ 
++                    // m52xq: the photo helper has the camera, the state of the application stays Active
++                    if (m_rawPhoto) {
++                        if (newState == GST_STATE_PLAYING && m_rawPhotoRestart) {
++                            m_rawPhoto = false;
++                            m_rawPhotoRestart = false;
++                            updateCaptureStatus();
++                            emit handleReadyForCaptureChanged(m_readyForCapture);
++                        }
++                        break;
++                    }
++
+                     switch (newState) {
+                     case GST_STATE_VOID_PENDING:
+                     case GST_STATE_NULL:
+@@ -1286,6 +1376,71 @@ static bool rateLessThan(const QPair<int,int> &r1, const QPair<int,int> &r2)
+      return r1.first*r2.second < r2.first*r1.second;
+ }
+ 
++// libcamerasrc only knows its formats once the camera is configured, so its pad answers
++// with the size-less template. libcamera's device provider lists the stream sizes of each
++// camera (one structure per size, plus one size range); keep the fixed sizes and the
++// largest size of each range, and add the frame rate range the callers expect.
++static GstCaps *libcameraDeviceCaps(GstElement *source)
++{
++    static QMap<QByteArray, QByteArray> cache;
++
++    gchar *name = 0;
++    g_object_get(G_OBJECT(source), "camera-name", &name, NULL);
++    const QByteArray cameraName(name);
++    g_free(name);
++    if (cameraName.isEmpty())
++        return 0;
++
++    if (!cache.contains(cameraName)) {
++        GstDeviceProvider *provider = gst_device_provider_factory_get_by_name("libcameraprovider");
++        if (!provider)
++            return 0;
++
++        GstCaps *result = gst_caps_new_empty();
++        GList *list = gst_device_provider_get_devices(provider);
++        for (GList *l = list; l; l = l->next) {
++            GstDevice *device = GST_DEVICE(l->data);
++            gchar *displayName = gst_device_get_display_name(device);
++            const bool match = cameraName == displayName;
++            g_free(displayName);
++            if (!match)
++                continue;
++
++            GstCaps *caps = gst_device_get_caps(device);
++            for (uint i = 0; caps && i < gst_caps_get_size(caps); ++i) {
++                GstStructure *s = gst_structure_copy(gst_caps_get_structure(caps, i));
++                const GValue *w = gst_structure_get_value(s, "width");
++                const GValue *h = gst_structure_get_value(s, "height");
++                if (w && h && GST_VALUE_HOLDS_INT_RANGE(w) && GST_VALUE_HOLDS_INT_RANGE(h)) {
++                    gst_structure_set(s,
++                                      "width", G_TYPE_INT, gst_value_get_int_range_max(w),
++                                      "height", G_TYPE_INT, gst_value_get_int_range_max(h),
++                                      NULL);
++                } else if (!w || !h || !G_VALUE_HOLDS_INT(w) || !G_VALUE_HOLDS_INT(h)) {
++                    gst_structure_free(s);
++                    continue;
++                }
++                if (!gst_structure_has_field(s, "framerate"))
++                    gst_structure_set(s, "framerate", GST_TYPE_FRACTION_RANGE, 1, 1, 30, 1, NULL);
++                gst_caps_append_structure(result, s);
++            }
++            if (caps)
++                gst_caps_unref(caps);
++        }
++        g_list_free_full(list, reinterpret_cast<GDestroyNotify>(gst_object_unref));
++        gst_object_unref(provider);
++
++        gchar *str = gst_caps_is_empty(result) ? 0 : gst_caps_to_string(result);
++        gst_caps_unref(result);
++        if (!str)
++            return 0;
++        cache.insert(cameraName, QByteArray(str));
++        g_free(str);
++    }
++
++    return gst_caps_from_string(cache.value(cameraName).constData());
++}
++
+ GstCaps *CameraBinSession::supportedCaps(QCamera::CaptureModes mode) const
+ {
+     GstCaps *supportedCaps = 0;
+@@ -1298,6 +1453,20 @@ GstCaps *CameraBinSession::supportedCaps(QCamera::CaptureModes mode) const
+             supportedCaps = qt_gst_pad_get_caps(pad);
+             gst_object_unref(GST_OBJECT(pad));
+         }
++
++        // A source without a caps query handler (libcamerasrc) answers with its pad
++        // template, which carries no width/height/framerate; the callers below
++        // dereference those fields. Treat such caps as unknown and fall back.
++        if (supportedCaps) {
++            bool hasSize = false;
++            for (uint i = 0; i < gst_caps_get_size(supportedCaps) && !hasSize; ++i)
++                hasSize = gst_structure_has_field(gst_caps_get_structure(supportedCaps, i), "width");
++            if (!hasSize) {
++                gst_caps_unref(supportedCaps);
++                supportedCaps = g_object_class_find_property(G_OBJECT_GET_CLASS(m_videoSrc), "camera-name")
++                        ? libcameraDeviceCaps(m_videoSrc) : 0;
++            }
++        }
+     }
+ 
+     // Otherwise, let the camerabin handle this.
+diff --git a/src/plugins/gstreamer/camerabin/camerabinsession.h b/src/plugins/gstreamer/camerabin/camerabinsession.h
+index 5f6a6524..a473a31c 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinsession.h
++++ b/src/plugins/gstreamer/camerabin/camerabinsession.h
+@@ -94,6 +94,18 @@ public:
+ #endif
+     GstElement *cameraBin() { return m_camerabin; }
+     GstElement *cameraSource() { return m_cameraSrc; }
++    // the element inside a wrapper source, e.g. libcamerasrc
++    GstElement *videoSource() { return m_videoSrc; }
++
++    // m52xq: full resolution photo by the helper m52xq-rawphoto; the pipeline is off (the camera is free) while it captures
++    static QString rawPhotoHelper();
++    bool rawPhotoPossible() const;
++    QString rawPhotoFileName(const QString &fileName);
++    int rawPhotoExifOrientation() const;
++    void beginRawPhoto();
++    void endRawPhoto();
++    bool inRawPhoto() const { return m_rawPhoto; }
++    bool libcameraSource() const;
+     QGstreamerBusHelper *bus() { return m_busHelper; }
+ 
+     QList< QPair<int,int> > supportedFrameRates(const QSize &frameSize, bool *continuous) const;
+@@ -222,6 +234,8 @@ private:
+     bool m_muted;
+     bool m_readyForCapture;
+     QMediaStorageLocation m_mediaStorageLocation;
++    bool m_rawPhoto;
++    bool m_rawPhotoRestart;
+ 
+     QCamera::CaptureModes m_captureMode;
+     QCamera::CaptureModes m_appliedCaptureMode;
+diff --git a/src/plugins/gstreamer/camerabin/camerabinzoom.cpp b/src/plugins/gstreamer/camerabin/camerabinzoom.cpp
+index 336ed2d5..7f6068b7 100644
+--- a/src/plugins/gstreamer/camerabin/camerabinzoom.cpp
++++ b/src/plugins/gstreamer/camerabin/camerabinzoom.cpp
+@@ -32,6 +32,7 @@
+ ****************************************************************************/
+ 
+ #include "camerabinzoom.h"
++#include "m52xqzoom.h"
+ #include "camerabinsession.h"
+ 
+ #define ZOOM_PROPERTY "zoom"
+@@ -61,6 +62,8 @@ qreal CameraBinZoom::maximumOpticalZoom() const
+ 
+ qreal CameraBinZoom::maximumDigitalZoom() const
+ {
++    if (m_session->libcameraSource())
++        return M52XQ_ZOOM_MAX;
+     gfloat zoomFactor = 1.0;
+     g_object_get(GST_BIN(m_session->cameraBin()), MAX_ZOOM_PROPERTY, &zoomFactor, NULL);
+     return zoomFactor;
+@@ -83,6 +86,8 @@ qreal CameraBinZoom::currentOpticalZoom() const
+ 
+ qreal CameraBinZoom::currentDigitalZoom() const
+ {
++    if (m_session->libcameraSource())
++        return m52xq_zoom_get();
+     gfloat zoomFactor = 1.0;
+     g_object_get(GST_BIN(m_session->cameraBin()), ZOOM_PROPERTY, &zoomFactor, NULL);
+     return zoomFactor;
+@@ -103,7 +108,10 @@ void CameraBinZoom::zoomTo(qreal optical, qreal digital)
+     }
+ 
+     digital = qBound(qreal(1.0), digital, maximumDigitalZoom());
+-    g_object_set(GST_BIN(m_session->cameraBin()), ZOOM_PROPERTY, digital, NULL);
++    if (m_session->libcameraSource())
++        m52xq_zoom_set(m_session->videoSource(), digital);
++    else
++        g_object_set(GST_BIN(m_session->cameraBin()), ZOOM_PROPERTY, digital, NULL);
+ 
+     qreal newDigitalZoom = currentDigitalZoom();
+     if (!qFuzzyCompare(oldDigitalZoom, newDigitalZoom))
+diff --git a/src/plugins/gstreamer/camerabin/m52xqautofocus.cpp b/src/plugins/gstreamer/camerabin/m52xqautofocus.cpp
+new file mode 100644
+index 00000000..fe425249
+--- /dev/null
++++ b/src/plugins/gstreamer/camerabin/m52xqautofocus.cpp
+@@ -0,0 +1,298 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "m52xqautofocus.h"
++
++#include <gst/video/video.h>
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <linux/videodev2.h>
++
++#define AF_INFINITY 335     // factory calibration (EEPROM): 335 = infinity, 621 = macro
++#define AF_MACRO 621
++#define AF_SETTLE 3
++#define AF_COARSE 50
++#define AF_FINE 15
++#define AF_FINE_SPAN 40
++#define AF_LOW_RATIO 0.4
++#define AF_LOW_FRAMES 45
++#define AF_MEAN_CHANGE 0.6
++
++enum { AF_SETTLING, AF_SCANNING, AF_HOLDING };
++
++struct M52xqAf
++{
++    GMutex mutex;
++    bool tapPending;
++    double tapU, tapV;
++    int searching;      // atomic: read by the GUI thread
++    int fd, state, pos, cur, bestPos, fine, fineFrom, fineTo, settle, lowFrames, warned;
++    double bestScore, reference, refMean, roiU, roiV;
++};
++
++static const char *afKey = "m52xq-af";
++
++static int openLens()
++{
++    for (int i = 0; i < 64; ++i) {
++        char path[96], name[64] = "";
++        snprintf(path, sizeof(path), "/sys/class/video4linux/v4l-subdev%d/name", i);
++        FILE *f = fopen(path, "r");
++        if (!f)
++            continue;
++        const bool lens = fgets(name, sizeof(name), f) && !strncmp(name, "fp5529", 6);
++        fclose(f);
++        if (lens) {
++            snprintf(path, sizeof(path), "/dev/v4l-subdev%d", i);
++            return open(path, O_RDWR | O_CLOEXEC);
++        }
++    }
++    return -1;
++}
++
++static void setPos(M52xqAf *a, int pos)
++{
++    struct v4l2_control c;
++    memset(&c, 0, sizeof(c));
++    c.id = V4L2_CID_FOCUS_ABSOLUTE;
++    c.value = CLAMP(pos, 0, 1023);
++    if (ioctl(a->fd, VIDIOC_S_CTRL, &c) == 0)
++        a->cur = c.value;
++}
++
++static void moveTo(M52xqAf *a, int pos)
++{
++    a->pos = CLAMP(pos, AF_INFINITY, AF_MACRO);
++    setPos(a, a->pos);
++    a->settle = AF_SETTLE;
++    a->state = AF_SETTLING;
++    g_atomic_int_set(&a->searching, 1);
++}
++
++static void startSearch(M52xqAf *a)
++{
++    // the whole range from infinity to macro, then fine around the best position: a search that started at the last locked
++    // (near) position never got to far objects
++    a->fine = 0; a->bestScore = 0; a->lowFrames = 0;
++    a->bestPos = AF_INFINITY;
++    moveTo(a, AF_INFINITY);
++}
++
++static void finishSearch(M52xqAf *a, int pos)
++{
++    a->bestPos = CLAMP(pos, AF_INFINITY, AF_MACRO);
++    setPos(a, a->bestPos);
++    a->reference = 0;
++    a->settle = AF_SETTLE;
++    a->state = AF_HOLDING;
++    g_atomic_int_set(&a->searching, 0);
++    g_message("m52xq-af: locked at %d", a->bestPos);
++}
++
++static void evaluate(M52xqAf *a, double score)
++{
++    if (!a->fine) {
++        if (score > a->bestScore) {
++            a->bestScore = score; a->bestPos = a->pos;
++        }
++        if (a->pos < AF_MACRO) {
++            moveTo(a, MIN(a->pos + AF_COARSE, AF_MACRO));
++            return;
++        }
++        a->fine = 1;
++        a->fineFrom = MAX(a->bestPos - AF_FINE_SPAN, AF_INFINITY);
++        a->fineTo = MIN(a->bestPos + AF_FINE_SPAN, AF_MACRO);
++        a->bestScore = 0;
++        moveTo(a, a->fineFrom);
++        return;
++    }
++    if (score > a->bestScore) {
++        a->bestScore = score; a->bestPos = a->pos;
++    }
++    if (a->pos >= a->fineTo) {
++        finishSearch(a, a->bestPos);
++        return;
++    }
++    moveTo(a, MIN(a->pos + AF_FINE, a->fineTo));
++}
++
++// Gradient energy of 4x4 block averages of the luma plane in the region of interest. Large frames are sampled every k-th pixel (the
++// viewfinder of jolla-camera has the photo size).
++static double sharpness(M52xqAf *a, const guint8 *data, int stride, int width, int height, double *mean)
++{
++    *mean = 0;
++    const int k = MAX(1, width / 1280);
++    const int w = width / k, h = height / k;
++    if (w < 64 || h < 64)
++        return 0;
++    const bool tapped = a->roiU >= 0;
++    int rw = (tapped ? w / 5 : w * 2 / 5) & ~3, rh = (tapped ? h / 5 : h * 2 / 5) & ~3;
++    int x0 = tapped ? int(a->roiU * w) - rw / 2 : (w - rw) / 2;
++    int y0 = tapped ? int(a->roiV * h) - rh / 2 : (h - rh) / 2;
++    x0 = CLAMP(x0, 0, w - rw) & ~3;
++    y0 = CLAMP(y0, 0, h - rh) & ~3;
++    const int bw = rw / 4, bh = rh / 4;
++    float *blocks = g_new(float, gsize(bw) * bh);
++    double sum = 0;
++    for (int by = 0; by < bh; ++by)
++        for (int bx = 0; bx < bw; ++bx) {
++            int acc = 0;
++            for (int j = 0; j < 4; ++j) {
++                const guint8 *line = data + gsize((y0 + by * 4 + j) * k) * stride + gsize((x0 + bx * 4) * k);
++                acc += line[0] + line[k] + line[2 * k] + line[3 * k];
++            }
++            blocks[by * bw + bx] = acc / 16.0f;
++            sum += blocks[by * bw + bx];
++        }
++    const double m = sum / (double(bw) * bh);
++    double energy = 0;
++    for (int by = 0; by < bh - 1; ++by)
++        for (int bx = 0; bx < bw - 1; ++bx) {
++            const double gx = blocks[by * bw + bx + 1] - blocks[by * bw + bx];
++            const double gy = blocks[(by + 1) * bw + bx] - blocks[by * bw + bx];
++            energy += gx * gx + gy * gy;
++        }
++    g_free(blocks);
++    *mean = m;
++    return energy / (double(bw) * bh) / MAX(m * m, 1.0) * 1000.0;
++}
++
++static void process(M52xqAf *a, double score, double mean)
++{
++    if (a->settle > 0 && a->state != AF_SCANNING) {
++        if (--a->settle > 0)
++            return;
++        if (a->state == AF_SETTLING)
++            a->state = AF_SCANNING;
++    }
++    switch (a->state) {
++    case AF_SCANNING:
++        evaluate(a, score);
++        break;
++    case AF_HOLDING:
++        if (a->reference <= 0) {
++            a->reference = score; a->refMean = mean; a->lowFrames = 0;
++            break;
++        }
++        if (score < a->reference * AF_LOW_RATIO || fabs(mean - a->refMean) > a->refMean * AF_MEAN_CHANGE) {
++            if (++a->lowFrames >= AF_LOW_FRAMES)
++                startSearch(a);
++        } else {
++            a->lowFrames = 0;
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static GstPadProbeReturn probe(GstPad *pad, GstPadProbeInfo *info, gpointer data)
++{
++    M52xqAf *a = static_cast<M52xqAf *>(data);
++    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
++    if (!buffer)
++        return GST_PAD_PROBE_OK;
++
++    g_mutex_lock(&a->mutex);
++    const bool tapped = a->tapPending;
++    if (tapped) {
++        a->roiU = a->tapU; a->roiV = a->tapV;
++        a->tapPending = false;
++    }
++    g_mutex_unlock(&a->mutex);
++    if (tapped)
++        startSearch(a);
++
++    if (a->settle > 1 && a->state == AF_SETTLING) {
++        a->settle--;
++        return GST_PAD_PROBE_OK;
++    }
++
++    GstCaps *caps = gst_pad_get_current_caps(pad);
++    if (!caps)
++        return GST_PAD_PROBE_OK;
++    GstVideoInfo vi;
++    const bool ok = gst_video_info_from_caps(&vi, caps);
++    gst_caps_unref(caps);
++    const GstVideoFormat format = ok ? GST_VIDEO_INFO_FORMAT(&vi) : GST_VIDEO_FORMAT_UNKNOWN;
++    if (format != GST_VIDEO_FORMAT_NV12 && format != GST_VIDEO_FORMAT_NV21) {
++        if (!a->warned) {
++            a->warned = 1;
++            g_message("m52xq-af: frame format not supported, no autofocus");
++            g_atomic_int_set(&a->searching, 0);
++        }
++        return GST_PAD_PROBE_OK;
++    }
++
++    GstMapInfo map;
++    if (!gst_buffer_map(buffer, &map, GST_MAP_READ))
++        return GST_PAD_PROBE_OK;
++    GstVideoMeta *meta = gst_buffer_get_video_meta(buffer);
++    const int w = GST_VIDEO_INFO_WIDTH(&vi), h = GST_VIDEO_INFO_HEIGHT(&vi);
++    const int stride = meta ? meta->stride[0] : GST_VIDEO_INFO_PLANE_STRIDE(&vi, 0);
++    const gsize offset = meta ? meta->offset[0] : 0;
++    if (offset + gsize(stride) * h <= map.size) {
++        double mean;
++        const double score = sharpness(a, map.data + offset, stride, w, h, &mean);
++        process(a, score, mean);
++    }
++    gst_buffer_unmap(buffer, &map);
++    return GST_PAD_PROBE_OK;
++}
++
++static void freeAf(gpointer data)
++{
++    M52xqAf *a = static_cast<M52xqAf *>(data);
++    if (a->fd >= 0)
++        close(a->fd);
++    g_mutex_clear(&a->mutex);
++    g_free(a);
++}
++
++M52xqAf *m52xq_af_get(GstElement *videoSource)
++{
++    return videoSource ? static_cast<M52xqAf *>(g_object_get_data(G_OBJECT(videoSource), afKey)) : 0;
++}
++
++M52xqAf *m52xq_af_attach(GstElement *videoSource)
++{
++    if (M52xqAf *a = m52xq_af_get(videoSource))
++        return a;
++    if (!videoSource)
++        return 0;
++    const int fd = openLens();
++    if (fd < 0)
++        return 0;
++    GstPad *pad = gst_element_get_static_pad(videoSource, "src");
++    if (!pad) {
++        close(fd);
++        return 0;
++    }
++    M52xqAf *a = g_new0(M52xqAf, 1);
++    g_mutex_init(&a->mutex);
++    a->fd = fd;
++    a->roiU = a->roiV = -1;
++    startSearch(a);
++    // the struct lives as long as the element (the probe is removed with its pad)
++    g_object_set_data_full(G_OBJECT(videoSource), afKey, a, freeAf);
++    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, probe, a, NULL);
++    gst_object_unref(pad);
++    g_message("m52xq-af: lens found, autofocus on");
++    return a;
++}
++
++void m52xq_af_tap(M52xqAf *a, double u, double v)
++{
++    g_mutex_lock(&a->mutex);
++    a->tapU = u; a->tapV = v;
++    a->tapPending = true;
++    g_mutex_unlock(&a->mutex);
++    g_atomic_int_set(&a->searching, 1);
++}
++
++bool m52xq_af_searching(M52xqAf *a)
++{
++    return g_atomic_int_get(&a->searching) != 0;
++}
+diff --git a/src/plugins/gstreamer/camerabin/m52xqautofocus.h b/src/plugins/gstreamer/camerabin/m52xqautofocus.h
+new file mode 100644
+index 00000000..2ac4e7d2
+--- /dev/null
++++ b/src/plugins/gstreamer/camerabin/m52xqautofocus.h
+@@ -0,0 +1,18 @@
++// M52XQ (Galaxy M52): software autofocus of the main camera (s5kgw3, voice coil lens fp5529) on the frames of libcamerasrc.
++// Port of m52xqcamsrc of our Ubuntu Touch port (LensAutofocus of our plasma-camera build): contrast search.
++#ifndef M52XQAUTOFOCUS_H
++#define M52XQAUTOFOCUS_H
++
++#include <gst/gst.h>
++
++struct M52xqAf;
++
++// Attaches the autofocus to the video source (once per element); 0 when there is no lens
++M52xqAf *m52xq_af_attach(GstElement *videoSource);
++M52xqAf *m52xq_af_get(GstElement *videoSource);
++// Starts a search around the point (0..1 of the frame), u < 0: the middle
++void m52xq_af_tap(M52xqAf *af, double u, double v);
++// true while the search runs, false when the lens holds a position
++bool m52xq_af_searching(M52xqAf *af);
++
++#endif
+diff --git a/src/plugins/gstreamer/camerabin/m52xqzoom.cpp b/src/plugins/gstreamer/camerabin/m52xqzoom.cpp
+new file mode 100644
+index 00000000..18f52420
+--- /dev/null
++++ b/src/plugins/gstreamer/camerabin/m52xqzoom.cpp
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "m52xqzoom.h"
++
++#include <gst/video/video.h>
++#include <string.h>
++
++static gint zoomPercent = 100;      // atomic, survives a new source
++static const char *zoomKey = "m52xq-zoom";
++
++double m52xq_zoom_get()
++{
++    return g_atomic_int_get(&zoomPercent) / 100.0;
++}
++
++// middle 1/z of the plane scaled up, nearest neighbour; pixels of "bytes" bytes
++static void scalePlane(const guint8 *src, int srcStride, guint8 *dst, int dstStride, int w, int h, double z, int bytes)
++{
++    const int cw = MAX(1, int(w / z)), ch = MAX(1, int(h / z));
++    const int x0 = (w - cw) / 2, y0 = (h - ch) / 2;
++    gint *xs = g_new(gint, w);
++    for (int x = 0; x < w; ++x)
++        xs[x] = x0 + int(gint64(x) * cw / w);
++    int lastY = -1;
++    for (int y = 0; y < h; ++y) {
++        const int sy = y0 + int(gint64(y) * ch / h);
++        guint8 *out = dst + gsize(y) * dstStride;
++        if (sy == lastY) {
++            memcpy(out, out - dstStride, gsize(w) * bytes);
++            continue;
++        }
++        lastY = sy;
++        const guint8 *in = src + gsize(sy) * srcStride;
++        if (bytes == 1) {
++            for (int x = 0; x < w; ++x)
++                out[x] = in[xs[x]];
++        } else {
++            const guint16 *in16 = reinterpret_cast<const guint16 *>(in);
++            guint16 *out16 = reinterpret_cast<guint16 *>(out);
++            for (int x = 0; x < w; ++x)
++                out16[x] = in16[xs[x]];
++        }
++    }
++    g_free(xs);
++}
++
++static GstPadProbeReturn probe(GstPad *pad, GstPadProbeInfo *info, gpointer)
++{
++    const double z = m52xq_zoom_get();
++    GstBuffer *in = GST_PAD_PROBE_INFO_BUFFER(info);
++    if (!in || z < 1.01)
++        return GST_PAD_PROBE_OK;
++    GstCaps *caps = gst_pad_get_current_caps(pad);
++    if (!caps)
++        return GST_PAD_PROBE_OK;
++    GstVideoInfo vi;
++    const bool ok = gst_video_info_from_caps(&vi, caps);
++    gst_caps_unref(caps);
++    if (!ok || (GST_VIDEO_INFO_FORMAT(&vi) != GST_VIDEO_FORMAT_NV12
++                && GST_VIDEO_INFO_FORMAT(&vi) != GST_VIDEO_FORMAT_NV21))
++        return GST_PAD_PROBE_OK;
++
++    GstVideoFrame src, dst;
++    if (!gst_video_frame_map(&src, &vi, in, GST_MAP_READ))
++        return GST_PAD_PROBE_OK;
++    GstBuffer *out = gst_buffer_new_allocate(NULL, GST_VIDEO_INFO_SIZE(&vi), NULL);
++    if (!out || !gst_video_frame_map(&dst, &vi, out, GST_MAP_WRITE)) {
++        if (out)
++            gst_buffer_unref(out);
++        gst_video_frame_unmap(&src);
++        return GST_PAD_PROBE_OK;
++    }
++    const int w = GST_VIDEO_INFO_WIDTH(&vi), h = GST_VIDEO_INFO_HEIGHT(&vi);
++    scalePlane(static_cast<const guint8 *>(GST_VIDEO_FRAME_PLANE_DATA(&src, 0)), GST_VIDEO_FRAME_PLANE_STRIDE(&src, 0),
++               static_cast<guint8 *>(GST_VIDEO_FRAME_PLANE_DATA(&dst, 0)), GST_VIDEO_FRAME_PLANE_STRIDE(&dst, 0), w, h, z, 1);
++    scalePlane(static_cast<const guint8 *>(GST_VIDEO_FRAME_PLANE_DATA(&src, 1)), GST_VIDEO_FRAME_PLANE_STRIDE(&src, 1),
++               static_cast<guint8 *>(GST_VIDEO_FRAME_PLANE_DATA(&dst, 1)), GST_VIDEO_FRAME_PLANE_STRIDE(&dst, 1), w / 2, h / 2, z, 2);
++    gst_video_frame_unmap(&dst);
++    gst_video_frame_unmap(&src);
++    gst_buffer_copy_into(out, in, GstBufferCopyFlags(GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS), 0, -1);
++    gst_buffer_unref(in);
++    GST_PAD_PROBE_INFO_DATA(info) = out;
++    return GST_PAD_PROBE_OK;
++}
++
++void m52xq_zoom_set(GstElement *videoSource, double factor)
++{
++    g_atomic_int_set(&zoomPercent, int(CLAMP(factor, 1.0, M52XQ_ZOOM_MAX) * 100 + 0.5));
++    if (!videoSource || factor < 1.01 || g_object_get_data(G_OBJECT(videoSource), zoomKey))
++        return;
++    GstPad *pad = gst_element_get_static_pad(videoSource, "src");
++    if (!pad)
++        return;
++    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, probe, NULL, NULL);
++    g_object_set_data(G_OBJECT(videoSource), zoomKey, GINT_TO_POINTER(1));
++    gst_object_unref(pad);
++}
+diff --git a/src/plugins/gstreamer/camerabin/m52xqzoom.h b/src/plugins/gstreamer/camerabin/m52xqzoom.h
+new file mode 100644
+index 00000000..44ba5052
+--- /dev/null
++++ b/src/plugins/gstreamer/camerabin/m52xqzoom.h
+@@ -0,0 +1,13 @@
++// M52XQ: digital zoom of the libcamerasrc frames (port of the zoom of m52xqcamsrc, Ubuntu Touch port): camerabin's own zoom flickers on them
++#ifndef M52XQZOOM_H
++#define M52XQZOOM_H
++
++#include <gst/gst.h>
++
++#define M52XQ_ZOOM_MAX 8.0
++
++// Sets the factor (1 = off); the probe is attached to the source pad at the first factor above 1
++void m52xq_zoom_set(GstElement *videoSource, double factor);
++double m52xq_zoom_get();
++
++#endif
+diff --git a/src/plugins/gstreamer/mediaplayer/qgstreamerplayersession.cpp b/src/plugins/gstreamer/mediaplayer/qgstreamerplayersession.cpp
+index 4dc82015..a35732ac 100644
+--- a/src/plugins/gstreamer/mediaplayer/qgstreamerplayersession.cpp
++++ b/src/plugins/gstreamer/mediaplayer/qgstreamerplayersession.cpp
+@@ -166,6 +166,36 @@ QGstreamerPlayerSession::QGstreamerPlayerSession(QObject *parent)
+ #endif
+         g_object_set(G_OBJECT(m_playbin), "flags", flags, NULL);
+ 
++#if GST_CHECK_VERSION(1,10,0)
++        // Turn the picture by the stream's image-orientation tag (portrait videos from a
++        // phone camera carry rotate-90 or rotate-270). The Sailfish video texture backend
++        // does this on hybris with droideglsink; Qt's own renderer ignores the tag, so a
++        // portrait video played as a sideways landscape band. videoflip in automatic mode
++        // passes unrotated streams through. QT_GSTREAMER_NO_AUTO_ORIENTATION=1 turns it off.
++        if (qEnvironmentVariableIsEmpty("QT_GSTREAMER_NO_AUTO_ORIENTATION")) {
++            GstElement *convert = gst_element_factory_make("videoconvert", NULL);
++            GstElement *flip = gst_element_factory_make("videoflip", NULL);
++            if (convert && flip) {
++                GstElement *orientationBin = gst_bin_new("video-orientation-bin");
++                g_object_set(G_OBJECT(flip), "video-direction", 8 /* GST_VIDEO_ORIENTATION_AUTO */, NULL);
++                gst_bin_add_many(GST_BIN(orientationBin), convert, flip, NULL);
++                gst_element_link(convert, flip);
++                GstPad *sinkPad = gst_element_get_static_pad(convert, "sink");
++                gst_element_add_pad(orientationBin, gst_ghost_pad_new("sink", sinkPad));
++                gst_object_unref(GST_OBJECT(sinkPad));
++                GstPad *srcPad = gst_element_get_static_pad(flip, "src");
++                gst_element_add_pad(orientationBin, gst_ghost_pad_new("src", srcPad));
++                gst_object_unref(GST_OBJECT(srcPad));
++                g_object_set(G_OBJECT(m_playbin), "video-filter", orientationBin, NULL);
++            } else {
++                if (convert)
++                    gst_object_unref(GST_OBJECT(convert));
++                if (flip)
++                    gst_object_unref(GST_OBJECT(flip));
++            }
++        }
++#endif
++
+         GstElement *audioSink = gst_element_factory_make("autoaudiosink", "audiosink");
+         if (audioSink) {
+             if (usePlaybinVolume()) {
+diff --git a/src/qtmultimediaquicktools/qdeclarativevideooutput.cpp b/src/qtmultimediaquicktools/qdeclarativevideooutput.cpp
+index cae6cf00..b3d7ba84 100644
+--- a/src/qtmultimediaquicktools/qdeclarativevideooutput.cpp
++++ b/src/qtmultimediaquicktools/qdeclarativevideooutput.cpp
+@@ -127,6 +127,8 @@ QDeclarativeVideoOutput::QDeclarativeVideoOutput(QQuickItem *parent) :
+     m_fillMode(PreserveAspectFit),
+     m_geometryDirty(true),
+     m_orientation(0),
++    m_sourceOrientation(0),
++    m_sourceMirrored(false),
+     m_autoOrientation(false),
+     m_screenOrientationHandler(0)
+ {
+@@ -317,12 +319,50 @@ void QDeclarativeVideoOutput::_q_updateCameraInfo()
+                 if (m_autoOrientation)
+                     _q_screenOrientationChanged(m_screenOrientationHandler->currentOrientation());
+             }
++
++            // Without autoOrientation the frames are drawn as the sensor delivers them. The
++            // hybris video texture backend rotates them by the image-orientation tag of the
++            // viewfinder stream (droidcamsrc) and mirrors front cameras; with Qt's own
++            // renderer (libcamerasrc, which sends no such tag) apply the camera's mounting
++            // orientation and the front camera mirror instead.
++            int sourceOrientation = 0;
++            bool sourceMirrored = false;
++#ifndef QT_NO_DYNAMIC_CAST
++            if (!m_autoOrientation && !info.isNull()
++                    && dynamic_cast<QDeclarativeVideoRendererBackend *>(m_backend.data())) {
++                // Mirroring reverses the rotation, as in _q_screenOrientationChanged()
++                sourceMirrored = info.position() == QCamera::FrontFace;
++                sourceOrientation = sourceMirrored ? (360 - info.orientation()) % 360
++                                                   : info.orientation();
++            }
++#endif
++            setSourceTransform(sourceOrientation, sourceMirrored);
+         }
+     } else {
+         m_cameraInfo = QCameraInfo();
++        setSourceTransform(0, false);
+     }
+ }
+ 
++void QDeclarativeVideoOutput::setSourceTransform(int orientation, bool mirrored)
++{
++    if (m_sourceOrientation == orientation && m_sourceMirrored == mirrored)
++        return;
++
++    const bool oldAspect = qIsDefaultAspect(renderOrientation());
++    m_sourceOrientation = orientation;
++    m_sourceMirrored = mirrored;
++    m_geometryDirty = true;
++
++    if (oldAspect != qIsDefaultAspect(renderOrientation())) {
++        m_nativeSize.transpose();
++        setImplicitWidth(m_nativeSize.width());
++        setImplicitHeight(m_nativeSize.height());
++    }
++
++    update();
++}
++
+ /*!
+     \qmlproperty enumeration QtMultimedia::VideoOutput::fillMode
+ 
+@@ -360,7 +400,7 @@ void QDeclarativeVideoOutput::_q_updateNativeSize()
+         return;
+ 
+     QSize size = m_backend->nativeSize();
+-    if (!qIsDefaultAspect(m_orientation)) {
++    if (!qIsDefaultAspect(renderOrientation())) {
+         size.transpose();
+     }
+ 
+@@ -476,8 +516,8 @@ void QDeclarativeVideoOutput::setOrientation(int orientation)
+ 
+     // Otherwise, a new orientation
+     // See if we need to change aspect ratio orientation too
+-    bool oldAspect = qIsDefaultAspect(m_orientation);
+-    bool newAspect = qIsDefaultAspect(orientation);
++    bool oldAspect = qIsDefaultAspect(renderOrientation());
++    bool newAspect = qIsDefaultAspect(orientation + m_sourceOrientation);
+ 
+     m_orientation = orientation;
+ 
+@@ -577,7 +617,7 @@ QRectF QDeclarativeVideoOutput::sourceRect() const
+ {
+     // We might have to transpose back
+     QSizeF size = m_nativeSize;
+-    if (!qIsDefaultAspect(m_orientation)) {
++    if (!qIsDefaultAspect(renderOrientation())) {
+         size.transpose();
+     }
+ 
+@@ -611,7 +651,7 @@ QPointF QDeclarativeVideoOutput::mapNormalizedPointToItem(const QPointF &point)
+     qreal dx = point.x();
+     qreal dy = point.y();
+ 
+-    if (qIsDefaultAspect(m_orientation)) {
++    if (qIsDefaultAspect(renderOrientation())) {
+         dx *= m_contentRect.width();
+         dy *= m_contentRect.height();
+     } else {
+@@ -619,7 +659,7 @@ QPointF QDeclarativeVideoOutput::mapNormalizedPointToItem(const QPointF &point)
+         dy *= m_contentRect.width();
+     }
+ 
+-    switch (qNormalizedOrientation(m_orientation)) {
++    switch (qNormalizedOrientation(renderOrientation())) {
+         case 0:
+         default:
+             return m_contentRect.topLeft() + QPointF(dx, dy);
+@@ -663,7 +703,7 @@ QPointF QDeclarativeVideoOutput::mapPointToSource(const QPointF &point) const
+ {
+     QPointF norm = mapPointToSourceNormalized(point);
+ 
+-    if (qIsDefaultAspect(m_orientation))
++    if (qIsDefaultAspect(renderOrientation()))
+         return QPointF(norm.x() * m_nativeSize.width(), norm.y() * m_nativeSize.height());
+     else
+         return QPointF(norm.x() * m_nativeSize.height(), norm.y() * m_nativeSize.width());
+@@ -709,7 +749,7 @@ QPointF QDeclarativeVideoOutput::mapPointToSourceNormalized(const QPointF &point
+     const qreal one(1.0f);
+ 
+     // For now, the origin of the source rectangle is 0,0
+-    switch (qNormalizedOrientation(m_orientation)) {
++    switch (qNormalizedOrientation(renderOrientation())) {
+         case 0:
+         default:
+             return QPointF(nx, ny);
+@@ -762,7 +802,7 @@ QPointF QDeclarativeVideoOutput::mapPointToItem(const QPointF &point) const
+ 
+     // Just normalize and use that function
+     // m_nativeSize is transposed in some orientations
+-    if (qIsDefaultAspect(m_orientation))
++    if (qIsDefaultAspect(renderOrientation()))
+         return mapNormalizedPointToItem(QPointF(point.x() / m_nativeSize.width(), point.y() / m_nativeSize.height()));
+     else
+         return mapNormalizedPointToItem(QPointF(point.x() / m_nativeSize.height(), point.y() / m_nativeSize.width()));
+diff --git a/src/qtmultimediaquicktools/qdeclarativevideooutput_render.cpp b/src/qtmultimediaquicktools/qdeclarativevideooutput_render.cpp
+index fbe8a62f..90f299e5 100644
+--- a/src/qtmultimediaquicktools/qdeclarativevideooutput_render.cpp
++++ b/src/qtmultimediaquicktools/qdeclarativevideooutput_render.cpp
+@@ -241,7 +241,7 @@ void QDeclarativeVideoRendererBackend::updateGeometry()
+         const qreal totalWidth = normalizedViewport.width() * relativeWidth;
+         const qreal totalHeight = normalizedViewport.height() * relativeHeight;
+ 
+-        if (qIsDefaultAspect(q->orientation())) {
++        if (qIsDefaultAspect(q->renderOrientation())) {
+             m_sourceTextureRect = QRectF(totalOffsetLeft, totalOffsetTop,
+                                          totalWidth, totalHeight);
+         } else {
+@@ -256,7 +256,7 @@ void QDeclarativeVideoRendererBackend::updateGeometry()
+         m_sourceTextureRect.setBottom(top);
+     }
+ 
+-    if (videoSurface()->surfaceFormat().property("mirrored").toBool()) {
++    if (videoSurface()->surfaceFormat().property("mirrored").toBool() != q->sourceMirrored()) {
+         qreal left = m_sourceTextureRect.left();
+         m_sourceTextureRect.setLeft(m_sourceTextureRect.right());
+         m_sourceTextureRect.setRight(left);
+@@ -347,7 +347,7 @@ QSGNode *QDeclarativeVideoRendererBackend::updatePaintNode(QSGNode *oldNode,
+ 
+     // Negative rotations need lots of %360
+     videoNode->setTexturedRectGeometry(m_renderedRect, m_sourceTextureRect,
+-                                       qNormalizedOrientation(q->orientation()));
++                                       qNormalizedOrientation(q->renderOrientation()));
+     if (m_frameChanged) {
+         QSGVideoNode::FrameFlags flags = 0;
+         if (isFrameModified)

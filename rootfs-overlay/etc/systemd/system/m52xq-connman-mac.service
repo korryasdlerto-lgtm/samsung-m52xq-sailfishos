@@ -1,0 +1,9 @@
+[Unit]
+Description=M52XQ: restart connman once after the EFS Wi-Fi address is set
+After=connman.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/m52xq-connman-mac
+TimeoutStartSec=60

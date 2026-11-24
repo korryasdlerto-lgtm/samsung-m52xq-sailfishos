@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Reboot menu
+Name[ru]=Меню перезагрузки
+Icon=icon-m-reboot
+Exec=/usr/bin/env QML_XHR_ALLOW_FILE_WRITE=1 /usr/bin/sailfish-qml m52xq-reboot-menu
+X-Nemo-Single-Instance=no
+
+[X-Sailjail]
+Sandboxing=Disabled

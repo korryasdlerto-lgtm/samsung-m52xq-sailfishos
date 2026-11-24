@@ -1,0 +1,53 @@
+M52XQ: qmimodem gprs: notice an LTE default bearer that is already up
+
+The WDS Data System Status event report arrives only on a change. When ofonod starts (or restarts) with LTE up it never
+arrives, so the default bearer is not reported: Attached stays false and connman has no cellular service.
+
+--- a/drivers/qmimodem/gprs.c
++++ b/drivers/qmimodem/gprs.c
+@@ -24,6 +24,7 @@
+ 	struct qmi_service *nas;
+ 	struct qmi_service *wds;
+ 	unsigned int default_profile;
++	bool lte_queried;
+ };
+ 
+ static bool extract_ss_info(struct qmi_result *result, int *status, int *tech)
+@@ -102,6 +103,7 @@
+ 
+ static int handle_ss_info(struct qmi_result *result, struct ofono_gprs *gprs)
+ {
++	struct gprs_data *data = ofono_gprs_get_data(gprs);
+ 	int status;
+ 	int tech;
+ 
+@@ -110,6 +112,21 @@
+ 	if (!extract_ss_info(result, &status, &tech))
+ 		return -1;
+ 
++	/*
++	 * M52XQ: the Data System Status event report arrives only on a change.
++	 * When ofonod starts with LTE already up it never arrives and the
++	 * default bearer is never noticed (Attached stays false): ask for the
++	 * LTE attach parameters once per stay on LTE.
++	 */
++	if (status == NETWORK_REGISTRATION_STATUS_REGISTERED &&
++			tech == ACCESS_TECHNOLOGY_EUTRAN) {
++		if (!data->lte_queried) {
++			data->lte_queried = true;
++			get_lte_attach_params(gprs);
++		}
++	} else
++		data->lte_queried = false;
++
+ 	return status;
+ }
+ 
+@@ -291,6 +308,7 @@
+ 	 * First get the SS info - the modem may already be connected,
+ 	 * and the state-change notification may never arrive
+ 	 */
++	data->lte_queried = false;	/* M52XQ: a query before this is lost */
+ 	qmi_service_send(data->nas, QMI_NAS_GET_SERVING_SYSTEM, NULL,
+ 					ss_info_notify, gprs, NULL);
+ 

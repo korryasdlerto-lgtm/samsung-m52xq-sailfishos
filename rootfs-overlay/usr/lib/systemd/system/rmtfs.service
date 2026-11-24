@@ -1,0 +1,11 @@
+[Unit]
+Description=Qualcomm remotefs service
+ConditionPathExists=/dev/qcom_rmtfs_mem1
+
+[Service]
+ExecStart=/usr/bin/rmtfs -r -P -s
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

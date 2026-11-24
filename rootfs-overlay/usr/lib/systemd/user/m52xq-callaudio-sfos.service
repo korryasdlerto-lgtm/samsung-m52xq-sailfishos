@@ -1,0 +1,11 @@
+[Unit]
+Description=M52XQ: voicecall-ui loud speaker / mute state for m52xq-voicecall
+After=voicecall-manager.service
+
+[Service]
+ExecStart=/usr/local/bin/m52xq-callaudio-sfos
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=user-session.target

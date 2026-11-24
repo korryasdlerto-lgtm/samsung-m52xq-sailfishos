@@ -1,0 +1,10 @@
+[Unit]
+Description=M52XQ: /run/m52xq-sim for the SIM cards manager requests
+DefaultDependencies=no
+After=local-fs.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'mkdir -p /run/m52xq-sim && chown root:users /run/m52xq-sim && chmod 0770 /run/m52xq-sim'
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+#!/usr/bin/python3 -u
+# M52XQ (Sailfish): hand the in-call buttons of voicecall-ui to m52xq-voicecall. voicecall-manager (session bus,
+# org.nemomobile.voicecall /, VoiceCallManager) has audioMode ("earpiece" / "ihf" = loud speaker) and isMicrophoneMuted;
+# m52xq-voicecall (root) reads {"speaker": …, "mic_muted": …} from /run/user/100000/m52xq-callaudio.json (on Debian written by
+# m52xq-callaudiod). Event driven: audioModeChanged / microphoneMutedChanged.
+import json, os
+from gi.repository import Gio, GLib
+
+SVC, PATH, IFACE = 'org.nemomobile.voicecall', '/', 'org.nemomobile.voicecall.VoiceCallManager'
+STATE = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/run/user/%d' % os.getuid()), 'm52xq-callaudio.json')
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+last = None
+
+def prop(name, default):
+    try:
+        r = bus.call_sync(SVC, PATH, 'org.freedesktop.DBus.Properties', 'Get', GLib.Variant('(ss)', (IFACE, name)),
+                          GLib.VariantType('(v)'), Gio.DBusCallFlags.NONE, 2000, None)
+        return r.unpack()[0]
+    except GLib.Error:
+        return default
+
+def update(*_):
+    global last
+    st = {'speaker': prop('audioMode', '') == 'ihf', 'mic_muted': bool(prop('isMicrophoneMuted', False))}
+    if st != last:
+        tmp = STATE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(st, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATE)
+        print('state', st)
+        last = st
+    return GLib.SOURCE_REMOVE
+
+for sig in ('audioModeChanged', 'microphoneMutedChanged'):
+    bus.signal_subscribe(SVC, IFACE, sig, PATH, None, Gio.DBusSignalFlags.NONE, lambda *a: GLib.idle_add(update), None)
+GLib.idle_add(update)
+GLib.MainLoop().run()

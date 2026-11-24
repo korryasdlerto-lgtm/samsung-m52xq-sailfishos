@@ -1,0 +1,2 @@
+# m52xq: the flash LED is switched by the user's top menu toggle and the Camera
+SUBSYSTEM=="leds", KERNEL=="white:flash", ACTION=="add|change", RUN+="/bin/sh -c 'chgrp video /sys/class/leds/white:flash/brightness; chmod 0664 /sys/class/leds/white:flash/brightness'"

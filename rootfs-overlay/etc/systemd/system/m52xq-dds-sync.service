@@ -1,0 +1,11 @@
+[Unit]
+Description=M52XQ: the modem data subscription follows the Sailfish data SIM
+After=ofono.service
+
+[Service]
+ExecStart=/usr/bin/python3 -u /usr/local/bin/m52xq-dds-sync
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,3 @@
+# m52xq: libcamera (software ISP) allocates its buffers from the system dma-buf heap; without access the session sees no cameras
+SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="video", MODE="0660"
+KERNEL=="udmabuf", GROUP="video", MODE="0660"

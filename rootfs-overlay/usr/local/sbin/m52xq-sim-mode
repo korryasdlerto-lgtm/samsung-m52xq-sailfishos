@@ -1,0 +1,224 @@
+#!/bin/sh
+# M52XQ (Sailfish): SIM mode (root). Port of the pmOS/Phosh m52xq-sim-mode to ofono + connman.
+#   m52xq-sim-mode dsds|sim1|sim2   both SIMs / only SIM 1 / only SIM 2 (saved in /etc/m52xq/sim-mode)
+#   m52xq-sim-mode apply            boot: the saved mode (m52xq-sim-mode-boot.service)
+#   m52xq-sim-mode data-on|data-off mobile data (AutoConnect of the connman cellular service = the Sailfish switch)
+#   m52xq-sim-mode data-sim1|data-sim2   the SIM of the mobile data (Sailfish default data SIM + modem data subscription, DDS)
+#   m52xq-sim-mode flight-on|flight-off   SIM cards and the modem radio off / on (connman OfflineMode = Sailfish flight mode)
+#   m52xq-sim-mode status           writes /run/m52xq-sim/state (JSON for the SIM manager) and prints it
+#   m52xq-sim-mode request          runs the request the SIM manager wrote to /run/m52xq-sim/request (m52xq-sim-request.path)
+# The SIMs stay in their slots: SIM 1 = slot 1 = primary GW session (ofono /qrtrsoc_0), SIM 2 = slot 2 = secondary GW session
+# (ofono /qrtrsoc_1, patch 0023). "Only SIM x" deactivates the provisioning session of the other SIM (it leaves the network, as
+# on pmOS) and disables its modem in the ofono slot manager (Settings, status bar and dialer show one SIM).
+# The data SIM is the Sailfish default data SIM (ofono slot manager, also changed by Settings -> Mobile network); the modem data
+# subscription (DDS, m52xq-dds) follows it: m52xq-dds-sync.service. Two ofono modems have gprs (patches 0028, 0029).
+CONF=/etc/m52xq/sim-mode
+RUN=/run/m52xq-sim
+Q="tmo 15 qmicli -d qrtr://0"
+M0=/qrtrsoc_0
+M1=/qrtrsoc_1
+
+log() { echo "m52xq-sim-mode: $*"; }
+
+tmo() {	# Sailfish has no timeout(1): run "$2..." and kill it after $1 s
+	t=$1; shift
+	"$@" &
+	p=$!
+	# no stdout: the sleep would keep a pipe of the caller open for the whole $t s
+	( sleep "$t"; kill "$p" ) >/dev/null 2>&1 </dev/null &
+	w=$!
+	wait "$p"
+	r=$?
+	kill "$w" 2>/dev/null
+	return $r
+}
+
+cards_present() {	# "1", "2", "12" ("" = unknown)
+	$Q --uim-get-card-status 2>/dev/null | awk '
+		/^Slot \[/ { s = $2; gsub(/[^0-9]/, "", s); next }
+		s != "" && /Card state:/ { if ($0 ~ /present/) p = p s; s = "" }
+		END { print p }'
+}
+
+aid() {	# AID of the first application on a card slot ("" for a 2G SIM)
+	$Q --uim-get-card-status 2>/dev/null | awk -v slot="Slot [$1]:" '
+		$0 ~ /^Slot \[/ { on = ($0 == slot) }
+		on && /Application ID:/ { getline; gsub(/[ \t]/, ""); if ($0 ~ /^[0-9A-F:]+$/) print; exit }'
+}
+
+session() {	# primary|secondary, slot, yes|no
+	st=$($Q --uim-get-card-status 2>/dev/null | grep -i "^[[:space:]]*$1 GW:")
+	case "$3:$st" in
+	yes:*"slot '$2'"*) return 0 ;;
+	no:*"doesn't exist"*) return 0 ;;
+	esac
+	if [ "$3" = yes ]; then
+		a=$(aid $2)
+		$Q --uim-change-provisioning-session="session-type=$1-gw-provisioning,activate=yes,slot=$2${a:+,aid=$a}" >/dev/null 2>&1
+	else
+		$Q --uim-change-provisioning-session="session-type=$1-gw-provisioning,activate=no" >/dev/null 2>&1
+	fi
+	log "$1 GW session (slot $2) activate=$3: $?"
+}
+
+enabled_modems() {	# ofono slot manager: the modems shown by Settings, the status bar and the dialer
+	args=
+	for m in "$@"; do args="$args${args:+,}$m"; done
+	dbus-send --system --print-reply --dest=org.ofono / org.nemomobile.ofono.ModemManager.SetEnabledModems \
+		"array:objpath:$args" >/dev/null 2>&1
+	log "enabled modems: $*: $?"
+}
+
+cell_service() {	# connman service path of the mobile data (SIM 1)
+	dbus-send --system --print-reply --dest=net.connman / net.connman.Manager.GetServices 2>/dev/null |
+		sed -n 's/.*object path "\(\/net\/connman\/service\/cellular_[^"]*\)".*/\1/p' | head -n1
+}
+
+svc_prop() {	# service, property -> value
+	dbus-send --system --print-reply --dest=net.connman "$1" net.connman.Service.GetProperties 2>/dev/null |
+		awk -v k="\"$2\"" '$0 ~ "string " k { getline; sub(/.*(string|boolean) /, ""); gsub(/"/, ""); print; exit }'
+}
+
+datasim() {	# SIM of the Sailfish default data modem: 1 or 2 ("" = none)
+	dbus-send --system --print-reply=literal --dest=org.ofono / org.nemomobile.ofono.ModemManager.GetDefaultDataModem 2>/dev/null |
+		sed -n 's/.*_0$/1/p; s/.*_1$/2/p' | tail -n1
+}
+
+imsi() {	# IMSI of SIM $1 (never logged)
+	dbus-send --system --print-reply=literal --dest=org.ofono /qrtrsoc_$(($1 - 1)) org.ofono.SimManager.GetProperties 2>/dev/null |
+		tr '\n' ' ' | sed -n 's/.*SubscriberIdentity *variant *\([0-9][0-9]*\).*/\1/p'
+}
+
+set_datasim() {	# $1 = 1|2: the default data SIM of Sailfish, then the modem data subscription
+	i=$(imsi $1)
+	[ -n "$i" ] || { log "SIM $1 has no identity yet"; return 1; }
+	dbus-send --system --print-reply --dest=org.ofono / org.nemomobile.ofono.ModemManager.SetDefaultDataSim string:"$i" >/dev/null 2>&1
+	log "default data SIM -> SIM $1: $?"
+	tmo 25 /usr/local/bin/m52xq-dds set $1 >/dev/null 2>&1
+	log "DDS -> SIM $1: $?"
+	apn_default $(($1 - 1))
+}
+
+apn_default() {	# internet context of a modem without an APN (provisioning did not find one): the usual "internet"
+	m=/qrtrsoc_$1
+	c=$(dbus-send --system --print-reply=literal --dest=org.ofono $m org.ofono.ConnectionManager.GetContexts 2>/dev/null |
+		grep -o "$m/context[0-9]*" | head -n1)
+	[ -n "$c" ] || return 0
+	a=$(dbus-send --system --print-reply=literal --dest=org.ofono $c org.ofono.ConnectionContext.GetProperties 2>/dev/null |
+		tr '\n' ' ' | sed -n 's/.*AccessPointName *variant *\([A-Za-z0-9._-]*\).*/\1/p')
+	case $a in "" | dict) ;; *) return 0 ;; esac
+	dbus-send --system --print-reply=literal --dest=org.ofono $c org.ofono.ConnectionContext.SetProperty \
+		string:AccessPointName variant:string:internet >/dev/null 2>&1
+	dbus-send --system --print-reply=literal --dest=org.ofono $c org.ofono.ConnectionContext.SetProperty \
+		string:AuthenticationMethod variant:string:none >/dev/null 2>&1
+	log "SIM $(($1 + 1)): empty APN set to internet"
+}
+
+offline() {
+	dbus-send --system --print-reply --dest=net.connman / net.connman.Manager.GetProperties 2>/dev/null |
+		awk '/"OfflineMode"/ { getline; print ($NF == "true") ? 1 : 0; exit }'
+}
+
+apply_mode() {	# $1 = mode; the cards really inserted decide when only one is in (the saved mode stays)
+	mode=$1
+	case $(cards_present) in
+	1) emode=sim1 ;;
+	2) emode=sim2 ;;
+	*) emode=$mode ;;
+	esac
+	[ "$emode" != "$mode" ] && log "one card inserted: $mode -> $emode (the saved mode is kept)"
+	case $emode in
+	dsds) session primary 1 yes; session secondary 2 yes; enabled_modems $M0 $M1 ;;
+	sim1) session primary 1 yes; session secondary 2 no; enabled_modems $M0 ;;
+	sim2) session secondary 2 yes; session primary 1 no; enabled_modems $M1 ;;
+	esac
+}
+
+write_state() {
+	mkdir -p $RUN
+	mode=$(cat $CONF 2>/dev/null || echo dsds)
+	cards=$(cards_present)
+	svc=$(cell_service)
+	data=0; conn=0; up=0
+	if [ -n "$svc" ]; then
+		conn=1
+		# the switch of the user (Sailfish), not the connection: with Wi-Fi the service stays idle
+		[ "$(svc_prop "$svc" AutoConnect)" = true ] && data=1
+		case $(svc_prop "$svc" State) in ready | online) up=1 ;; esac
+	fi
+	printf '{"mode":"%s","cards":"%s","flight":%s,"conn":%s,"data":%s,"up":%s,"datasim":"%s","busy":%s}\n' \
+		"$mode" "$cards" "$(offline || echo 0)" "$conn" "$data" "$up" "$(datasim)" "${BUSY:-0}" > $RUN/state.new
+	chmod 644 $RUN/state.new
+	mv -f $RUN/state.new $RUN/state
+	cat $RUN/state
+}
+
+run() {
+	case $1 in
+	dsds | sim1 | sim2)
+		mkdir -p ${CONF%/*}; echo $1 > $CONF; sync
+		if [ "$(offline)" = 1 ]; then
+			log "flight mode is on: $1 saved, used when flight mode is turned off"
+		else
+			apply_mode $1
+		fi ;;
+	apply)
+		# wait for the modem UIM service and the two ofono modems (boot)
+		for i in $(seq 60); do
+			$Q --uim-get-card-status >/dev/null 2>&1 && break
+			sleep 2
+		done
+		[ "$(offline)" = 1 ] || apply_mode "$(cat $CONF 2>/dev/null || echo dsds)" ;;
+	data-on | data-off)
+		svc=$(cell_service)
+		[ -n "$svc" ] || { log "no mobile data service in connman"; return 1; }
+		if [ $1 = data-on ]; then
+			dbus-send --system --print-reply --dest=net.connman "$svc" net.connman.Service.SetProperty \
+				string:AutoConnect variant:boolean:true >/dev/null 2>&1
+			# no reply: Connect can take a minute (the window would wait)
+			dbus-send --system --dest=net.connman "$svc" net.connman.Service.Connect >/dev/null 2>&1
+		else
+			dbus-send --system --print-reply --dest=net.connman "$svc" net.connman.Service.SetProperty \
+				string:AutoConnect variant:boolean:false >/dev/null 2>&1
+			dbus-send --system --print-reply --dest=net.connman "$svc" net.connman.Service.Disconnect >/dev/null 2>&1
+		fi
+		log "$1 ($svc): $?" ;;
+	data-sim1 | data-sim2)
+		n=${1#data-sim}
+		on=$(svc_prop "$(cell_service)" AutoConnect)
+		set_datasim "$n" || return 1
+		# the new SIM gets the same switch position as the old one
+		if [ "$on" = true ]; then
+			for i in $(seq 10); do
+				sleep 2
+				svc=$(cell_service)
+				[ -n "$svc" ] && break
+			done
+			[ -n "$svc" ] && dbus-send --system --print-reply --dest=net.connman "$svc" net.connman.Service.SetProperty \
+				string:AutoConnect variant:boolean:true >/dev/null 2>&1
+		fi ;;
+	flight-on | flight-off)
+		v=true; [ $1 = flight-off ] && v=false
+		dbus-send --system --print-reply --dest=net.connman / net.connman.Manager.SetProperty \
+			string:OfflineMode variant:boolean:$v >/dev/null 2>&1
+		log "flight mode $v: $?"
+		# radio back: the saved SIM mode again (sessions and modems)
+		[ $1 = flight-off ] && { sleep 5; apply_mode "$(cat $CONF 2>/dev/null || echo dsds)"; } ;;
+	status) ;;
+	*) echo "usage: $0 dsds|sim1|sim2|apply|data-on|data-off|data-sim1|data-sim2|flight-on|flight-off|status|request" >&2; return 2 ;;
+	esac
+}
+
+case $1 in
+request)
+	f=$RUN/request
+	[ -s "$f" ] || { write_state >/dev/null; exit 0; }
+	a=$(head -c 16 "$f" | tr -dc 'a-z0-9-'); rm -f "$f"
+	# a plain refresh does not show "Please wait"
+	[ "$a" = refresh ] && { BUSY=0 write_state >/dev/null; exit 0; }
+	BUSY=1 write_state >/dev/null
+	run "$a"
+	BUSY=0 write_state >/dev/null ;;
+status) write_state ;;
+*) run "$@"; write_state >/dev/null ;;
+esac

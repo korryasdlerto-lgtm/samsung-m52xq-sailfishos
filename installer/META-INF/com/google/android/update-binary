@@ -1,0 +1,397 @@
+#!/sbin/sh
+# Sailfish OS 5.2 mainline v1 -- m52xq (Samsung Galaxy M52 5G, SM-M526B)
+# Native Sailfish OS 5.2.0.22 (no libhybris) + Mesa freedreno on mainline Linux 7.1.13.
+#
+# Layout (as the pmOS ports): boot.img (+ IPA firmware of this phone appended to the ramdisk), vendor_boot, dtbo-frag,
+# and a GPT disk image on the system partition: p1 pmOS_boot (ext2, kernel + initramfs), p2 pmOS_root (ext4, Sailfish).
+# The image is cut into chunks (TWRP's unzip -p cannot stream one file of several GB) and reassembled in /data first.
+# p2 is shrunk to the minimum in the zip; the system partition is grown with lptools and the root filesystem is grown
+# to the whole partition at the first boot (initramfs resize).
+#
+# Public image: no proprietary firmware and no data of any phone. Taken here from THIS phone, read-only:
+#   apnhlos : ADSP (sound, sensors), GPU zap shader, IPA (mobile data), Venus (video)
+#   modem   : modem firmware (calls, SMS, GPS)
+#   vendor  : Bluetooth firmware, sensor configs
+#   persist : sensor registry (factory calibration)
+#   efs     : Bluetooth and Wi-Fi addresses -> /etc/m52xq/bt_addr and wifi_mac (used at every boot by m52xq-bt-firmware and
+#             m52xq-wifi-mac)
+# Per phone identity: machine-id here, ssh host keys at the first boot (sshd-keys.service), the user (defaultuser) is
+# created at the first start (start-autologin) and the start wizard runs.
+#
+# Note: the initramfs boots /data/rootfs.img instead of the system partition if that file exists.
+
+OUTFD=$2
+ZIP=$3
+
+ui_print() {
+    echo -e "ui_print $1\nui_print" >> /proc/self/fd/$OUTFD
+}
+
+next_step() {
+    echo -e "progress $1 $2" >> /proc/self/fd/$OUTFD
+}
+
+abort() {
+    ui_print "ERROR: $1"
+    exit 1
+}
+
+ui_print "======================================"
+ui_print " Sailfish OS 5.2 mainline v1 — m52xq"
+ui_print " boot+vendor_boot+dtbo+system(Mer, sailfishos_5.2.0.22)"
+ui_print " Build by Asdlerto Korry"
+ui_print " korryasdlerto@gmail.com"
+ui_print " https://github.com/korryasdlerto-lgtm/samsung-m52xq-sailfishos"
+ui_print "======================================"
+ui_print ""
+
+# --- partitions ---
+BOOT_PART=""
+for p in /dev/block/by-name/boot /dev/block/bootdevice/by-name/boot /dev/block/platform/*/by-name/boot; do
+    [ -b "$p" ] && BOOT_PART="$p" && break
+done
+[ -z "$BOOT_PART" ] && abort "boot partition not found (by-name/boot missing)"
+VBOOT_PART=""
+for p in /dev/block/by-name/vendor_boot /dev/block/bootdevice/by-name/vendor_boot /dev/block/platform/*/by-name/vendor_boot; do
+    [ -b "$p" ] && VBOOT_PART="$p" && break
+done
+[ -z "$VBOOT_PART" ] && abort "vendor_boot partition not found (by-name/vendor_boot missing)"
+DTBO_PART=""
+for p in /dev/block/by-name/dtbo /dev/block/bootdevice/by-name/dtbo /dev/block/platform/*/by-name/dtbo; do
+    [ -b "$p" ] && DTBO_PART="$p" && break
+done
+[ -z "$DTBO_PART" ] && abort "dtbo partition not found (by-name/dtbo missing)"
+ui_print "- boot partition: $BOOT_PART"
+ui_print "- vendor_boot partition: $VBOOT_PART"
+ui_print "- dtbo partition: $DTBO_PART"
+
+# kernel 7.1.13 of this port + vendor_boot (RTC) + dtbo-frag, live-proven with this Sailfish image
+BOOT_IMG_NAME="firmware/boot_v263_k7.1.13_sleep-autosleep-wakelocks_clean.img"
+VBOOT_IMG_NAME="firmware/vendor_boot_m52xq-local-v35-rtc.img"
+DTBO_IMG_NAME="firmware/dtbo-frag-m52xq.img"
+unzip -l "$ZIP" "$BOOT_IMG_NAME" | grep -q "$BOOT_IMG_NAME" || abort "$BOOT_IMG_NAME not found in zip"
+unzip -l "$ZIP" "$VBOOT_IMG_NAME" | grep -q "$VBOOT_IMG_NAME" || abort "$VBOOT_IMG_NAME not found in zip"
+unzip -l "$ZIP" "$DTBO_IMG_NAME" | grep -q "$DTBO_IMG_NAME" || abort "$DTBO_IMG_NAME not found in zip"
+
+# The IPA firmware (yupik_ipa_fws.*, proprietary) is not in the zip. The kernel needs it in the initramfs (IPA is built in and
+# probes before the rootfs is mounted), so it is appended to the ramdisk of boot.img here, from this phone's own apnhlos
+# partition, as a second gzip compressed newc cpio archive (the kernel unpacks every archive). Same code as the pmOS ports.
+m52xq_boot_add_ipa() {
+    IMG="$1"; A=/tmp/m52xq-apn-boot; ST=/tmp/m52xq-ipa
+    rm -rf "$ST"; mkdir -p "$A" "$ST/usr/lib/firmware" || return 1
+    got=0
+    for p in /dev/block/by-name/apnhlos /dev/block/bootdevice/by-name/apnhlos; do
+        [ -b "$p" ] || continue
+        if mount -t vfat -o ro "$p" "$A"; then
+            [ -f "$A/image/yupik_ipa_fws.mdt" ] && cp "$A"/image/yupik_ipa_fws.* "$ST/usr/lib/firmware/" && got=1
+            umount "$A"
+        fi
+        break
+    done
+    rmdir "$A" 2>/dev/null
+    [ "$got" = 1 ] || return 1
+    chmod 644 "$ST"/usr/lib/firmware/*
+    ks=$(od -An -tu4 -j8 -N4 "$IMG" | tr -d ' ')
+    rs=$(od -An -tu4 -j12 -N4 "$IMG" | tr -d ' ')
+    roff=$(( 4096 + (ks + 4095) / 4096 * 4096 ))
+    end=$(( roff + rs ))
+    head -c "$end" "$IMG" > "$IMG.new" || return 1
+    n=$(( (4 - end % 4) % 4 ))
+    [ "$n" -gt 0 ] && dd if=/dev/zero bs=1 count="$n" 2>/dev/null >> "$IMG.new"
+    ( cd "$ST" && find usr/lib/firmware -type f | sort | cpio -o -H newc | gzip -9 ) >> "$IMG.new" || return 1
+    sz=$(stat -c %s "$IMG.new")
+    nrs=$(( sz - roff ))
+    n=$(( (4096 - sz % 4096) % 4096 ))
+    [ "$n" -gt 0 ] && dd if=/dev/zero bs=1 count="$n" 2>/dev/null >> "$IMG.new"
+    h=$(printf '%08x' "$nrs")
+    printf '%s' "${h:6:2}${h:4:2}${h:2:2}${h:0:2}" | xxd -r -p | dd of="$IMG.new" bs=1 seek=12 conv=notrunc 2>/dev/null
+    [ "$(od -An -tu4 -j12 -N4 "$IMG.new" | tr -d ' ')" = "$nrs" ] || return 1
+    mv "$IMG.new" "$IMG"
+    rm -rf "$ST"
+    return 0
+}
+
+# --- system partition ---
+SYSTEM_DEV=""
+for p in /dev/mapper/system /dev/block/mapper/system /dev/block/by-name/system /dev/block/bootdevice/by-name/system; do
+    [ -b "$p" ] && SYSTEM_DEV="$p" && break
+done
+[ -z "$SYSTEM_DEV" ] && abort "system device node not found (checked /dev/mapper/system and friends)"
+
+# Grow system in the LP metadata (super) so that the root filesystem can grow at the first boot. Fixed targets, largest
+# first (lptools free is unreliable); if nothing fits the current size is kept and the flash goes on.
+LPTOOLS=""
+for p in /system/bin/lptools /sbin/lptools /bin/lptools; do
+    [ -x "$p" ] && LPTOOLS="$p" && break
+done
+if [ -n "$LPTOOLS" ]; then
+    RESIZE_OK=0
+    for TARGET in 8000000000 7000000000 6000000000 5500000000 5000000000; do
+        ui_print "- Growing system in LP metadata to $TARGET bytes via $LPTOOLS..."
+        if "$LPTOOLS" resize system "$TARGET"; then
+            RESIZE_OK=1
+            break
+        fi
+        ui_print "  $TARGET unavailable, retrying with a smaller fixed target..."
+    done
+    [ "$RESIZE_OK" = "1" ] || ui_print "  WARNING: no target fits, keeping current system size."
+    if [ "$RESIZE_OK" = "1" ]; then
+        ui_print "  lptools resize OK."
+        ui_print "  Remapping system device node to pick up new size..."
+        "$LPTOOLS" unmap system 2>/dev/null
+        "$LPTOOLS" map system 2>/dev/null
+        SYSTEM_DEV=""
+        for p in /dev/mapper/system /dev/block/mapper/system /dev/block/by-name/system /dev/block/bootdevice/by-name/system; do
+            [ -b "$p" ] && SYSTEM_DEV="$p" && break
+        done
+        [ -z "$SYSTEM_DEV" ] && abort "system device node not found after lptools remap"
+    fi
+else
+    ui_print "  WARNING: lptools not found, keeping current system size."
+fi
+DEV_SIZE=$(blockdev --getsize64 "$SYSTEM_DEV" 2>/dev/null)
+ui_print "- system device: $SYSTEM_DEV (size=$DEV_SIZE)"
+blockdev --setrw "$SYSTEM_DEV" 2>/dev/null
+
+# --- m52xq (2026-11-17): stop BEFORE anything is written when the image does not fit into system. XDA: after UN1CA 3.2.1 the
+#     super group had no room, system stayed smaller than the image, the image was written truncated (loop0 I/O error, no
+#     firmware injected, garbage on screen). Sizes compared in awk (toybox [ / $(( )) are 32-bit). ---
+IMG_SIZE=$(unzip -l "$ZIP" 'data/rootfs-chunks/*' 2>/dev/null | awk '/rootfs-chunks\/.*\.img\.part-/ {s+=$1} END {printf "%.0f", s}')
+if [ -n "$DEV_SIZE" ] && [ -n "$IMG_SIZE" ] && [ "$IMG_SIZE" != "0" ]; then
+    ui_print "- image size: $IMG_SIZE bytes"
+    if awk -v i="$IMG_SIZE" -v d="$DEV_SIZE" 'BEGIN { exit !(i > d) }'; then
+        ui_print ""
+        ui_print "!! The system partition ($DEV_SIZE bytes) is smaller than the image ($IMG_SIZE bytes):"
+        ui_print "!! not enough free space in super after the ROM that was installed before."
+        ui_print "!! Flash UN1CA 3.1.0 exactly as in the instructions, then this zip again."
+        abort "system partition too small -- nothing was written (boot, vendor_boot, dtbo and system are untouched)"
+    fi
+else
+    ui_print "  WARNING: could not read the image size from the zip, size check skipped."
+fi
+
+next_step 0.10 5
+ui_print "- Flashing boot.img..."
+unzip -p "$ZIP" "$BOOT_IMG_NAME" > /tmp/m52xq-boot.img || abort "failed to extract $BOOT_IMG_NAME"
+if m52xq_boot_add_ipa /tmp/m52xq-boot.img; then
+    ui_print "  IPA firmware taken from this phone's apnhlos partition"
+else
+    ui_print "  WARNING: no IPA firmware on apnhlos -- mobile data will not work"
+fi
+cat /tmp/m52xq-boot.img > "$BOOT_PART" || abort "failed to write $BOOT_IMG_NAME"
+rm -f /tmp/m52xq-boot.img /tmp/m52xq-boot.img.new
+
+next_step 0.10 5
+ui_print "- Flashing vendor_boot.img..."
+unzip -p "$ZIP" "$VBOOT_IMG_NAME" > "$VBOOT_PART" || abort "failed to write $VBOOT_IMG_NAME"
+
+next_step 0.02 1
+ui_print "- Flashing dtbo (dtbo-frag)..."
+unzip -p "$ZIP" "$DTBO_IMG_NAME" > "$DTBO_PART" || abort "failed to write $DTBO_IMG_NAME"
+
+
+next_step 0.60 30
+ui_print "- Reassembling sailfishos-m52xq.img from chunks (avoids TWRP unzip OOM)..."
+rm -f /data/sailfishos-m52xq.img
+for part in $(unzip -l "$ZIP" 'data/rootfs-chunks/*' | awk '/rootfs-chunks\/sailfishos-m52xq.img.part-/ { sub(/.*\//, "", $4); print $4 }' | sort); do
+    ui_print "  - $part"
+    unzip -p "$ZIP" "data/rootfs-chunks/$part" >> /data/sailfishos-m52xq.img || abort "failed to copy $part"
+done
+[ -s /data/sailfishos-m52xq.img ] || abort "sailfishos-m52xq.img reassembly produced an empty file"
+IMG_SIZE=$(stat -c %s /data/sailfishos-m52xq.img)
+# awk: [ -gt ] of the recovery shell is 32-bit (3030179840 > 7000000000 is "true" there)
+[ -n "$DEV_SIZE" ] && awk -v i="$IMG_SIZE" -v d="$DEV_SIZE" 'BEGIN { exit !(i > d) }' && \
+    abort "image ($IMG_SIZE bytes) is larger than system ($DEV_SIZE bytes)"
+ui_print "- Writing sailfishos-m52xq.img to system..."
+dd if=/data/sailfishos-m52xq.img of="$SYSTEM_DEV" bs=4M 2>/dev/null \
+    || abort "failed to write sailfishos-m52xq.img to $SYSTEM_DEV"
+rm -f /data/sailfishos-m52xq.img
+sync
+
+# --- this phone's own firmware and identity into p2 (pmOS_root) ---
+next_step 0.15 10
+ui_print "- Copying this phone's firmware into the Sailfish root..."
+P2_INFO=$(sgdisk --info=2 "$SYSTEM_DEV" 2>/dev/null)
+P2_START=$(echo "$P2_INFO" | grep '^First sector:' | awk '{print $3}')
+P2_SIZE_SECTORS=$(echo "$P2_INFO" | grep '^Partition size:' | awk '{print $3}')
+P2_LOOP=""
+if [ -n "$P2_START" ] && [ -n "$P2_SIZE_SECTORS" ]; then
+    P2_START_BYTES=$(awk -v a="$P2_START" 'BEGIN{printf "%.0f", a*4096}')
+    P2_SIZE_BYTES=$(awk -v a="$P2_SIZE_SECTORS" 'BEGIN{printf "%.0f", a*4096}')
+    P2_LOOP=$(losetup -f -s -o "$P2_START_BYTES" -S "$P2_SIZE_BYTES" "$SYSTEM_DEV" 2>/dev/null)
+fi
+[ -n "$P2_LOOP" ] || abort "cannot map the root partition (p2) of the system image"
+R=/mnt/m52xq-sailfish-root
+mkdir -p "$R"
+mount -t ext4 -o rw "$P2_LOOP" "$R" || abort "cannot mount the root partition (p2) of the system image"
+FW="$R/lib/firmware"
+mkdir -p "$FW"
+
+# apnhlos: ADSP, GPU zap shader, IPA, Venus
+APN_OK=0
+for p in /dev/block/by-name/apnhlos /dev/block/bootdevice/by-name/apnhlos; do
+    [ -b "$p" ] || continue
+    mkdir -p /tmp/m52xq-apn
+    if mount -t vfat -o ro "$p" /tmp/m52xq-apn; then
+        I=/tmp/m52xq-apn/image
+        if [ -f "$I/adsp.mdt" ] && [ -f "$I/vpu20_1v.mdt" ]; then
+            mkdir -p "$FW/qcom/vpu-2.0"
+            cp "$I"/adsp.mdt "$I"/adsp.b* "$I"/adspr.jsn "$I"/adsps.jsn "$I"/adspua.jsn \
+               "$I"/a660_zap.* "$I"/yupik_ipa_fws.* "$FW"/ && APN_OK=1
+            for f in "$I"/vpu20_1v.*; do
+                cp "$f" "$FW/qcom/vpu-2.0/venus.${f##*.}" || APN_OK=0
+            done
+            cp "$I/vpu20_1v.mdt" "$FW/qcom/vpu-2.0/venus.mbn" || APN_OK=0
+            chmod 644 "$FW"/adsp* "$FW"/a660_zap.* "$FW"/yupik_ipa_fws.* "$FW"/qcom/vpu-2.0/* 2>/dev/null
+        fi
+        umount /tmp/m52xq-apn
+    fi
+    rmdir /tmp/m52xq-apn 2>/dev/null
+    break
+done
+if [ "$APN_OK" = "1" ]; then
+    ui_print "  ADSP / GPU / IPA / Venus firmware taken from this phone's apnhlos partition"
+else
+    ui_print "  WARNING: firmware missing on apnhlos -- sound, sensors, GPU or video may not work"
+fi
+
+# modem: calls, SMS, GPS
+MODEM_FW_OK=0
+for p in /dev/block/by-name/modem /dev/block/bootdevice/by-name/modem; do
+    [ -b "$p" ] || continue
+    mkdir -p /tmp/m52xq-modem
+    if mount -t vfat -o ro "$p" /tmp/m52xq-modem; then
+        if [ -f /tmp/m52xq-modem/image/modem.mdt ]; then
+            cp /tmp/m52xq-modem/image/modem.mdt /tmp/m52xq-modem/image/modem.b* \
+               /tmp/m52xq-modem/image/modemr.jsn "$FW"/ && \
+            cp -r /tmp/m52xq-modem/image/modem_pr "$FW"/ && MODEM_FW_OK=1
+            chmod 644 "$FW"/modem.* "$FW"/modemr.jsn 2>/dev/null
+            find "$FW/modem_pr" -type d -exec chmod 755 {} + 2>/dev/null
+            find "$FW/modem_pr" -type f -exec chmod 644 {} + 2>/dev/null
+        fi
+        umount /tmp/m52xq-modem
+    fi
+    rmdir /tmp/m52xq-modem 2>/dev/null
+    break
+done
+if [ "$MODEM_FW_OK" = "1" ]; then
+    ui_print "  Modem firmware taken from this phone's modem partition"
+else
+    ui_print "  WARNING: no modem firmware found -- calls / SMS / GPS stay off"
+fi
+
+# vendor: Bluetooth firmware, sensor configs
+SN="$R/usr/share/qcom/sm7325/Samsung/m52xq/sensors"
+VEN_OK=0
+for p in /dev/block/mapper/vendor /dev/mapper/vendor /dev/block/by-name/vendor; do
+    [ -b "$p" ] || continue
+    mkdir -p /tmp/m52xq-vendor
+    if mount -t erofs -o ro "$p" /tmp/m52xq-vendor 2>/dev/null || \
+       mount -t ext4 -o ro,noload "$p" /tmp/m52xq-vendor 2>/dev/null; then
+        V=/tmp/m52xq-vendor
+        if [ -f "$V/firmware/msbtfw11.mbn" ] && [ -d "$V/etc/sensors/config" ]; then
+            mkdir -p "$FW/qca" "$SN/config"
+            cp "$V"/firmware/msbtfw11.mbn "$V"/firmware/msbtfw11.tlv "$V"/firmware/msnv11.bin "$FW/qca/" && \
+            cp "$V/etc/sensors/sns_reg_config" "$SN/sns_reg.conf" && \
+            cp "$V"/etc/sensors/config/*.json "$SN/config/" && VEN_OK=1
+            chmod 644 "$FW"/qca/* "$SN/sns_reg.conf" "$SN"/config/* 2>/dev/null
+        fi
+        umount /tmp/m52xq-vendor
+    fi
+    rmdir /tmp/m52xq-vendor 2>/dev/null
+    [ "$VEN_OK" = "1" ] && break
+done
+if [ "$VEN_OK" = "1" ]; then
+    ui_print "  Bluetooth firmware and sensor configs taken from this phone's vendor partition"
+else
+    ui_print "  WARNING: vendor partition not readable -- Bluetooth / sensors may not work"
+fi
+
+# persist: sensor registry (factory calibration of this phone); hexagonrpcd maps persist sensors/registry/registry to
+# sensors/registry/, so the files go there flat
+SNS_REG="$SN/registry"
+mkdir -p "$SNS_REG"
+for p in /dev/block/by-name/persist /dev/block/bootdevice/by-name/persist; do
+    [ -e "$p" ] || continue
+    mkdir -p /tmp/m52xq-persist
+    if mount -t ext4 -o ro,noload "$p" /tmp/m52xq-persist; then
+        if [ -d /tmp/m52xq-persist/sensors/registry/registry ]; then
+            cp -a /tmp/m52xq-persist/sensors/registry/registry/. "$SNS_REG"/ && \
+                ui_print "  Sensor registry taken from this phone's persist"
+        fi
+        umount /tmp/m52xq-persist
+    fi
+    rmdir /tmp/m52xq-persist 2>/dev/null
+    break
+done
+[ -n "$(ls -A "$SNS_REG" 2>/dev/null)" ] || \
+    ui_print "  WARNING: no sensor registry in persist -- sensors stay unavailable"
+FRPC_UID=$(awk -F: '$1=="fastrpc"{print $3}' "$R/etc/passwd")
+FRPC_GID=$(awk -F: '$1=="fastrpc"{print $3}' "$R/etc/group")
+[ -n "$FRPC_UID" ] && chown -R "$FRPC_UID:${FRPC_GID:-$FRPC_UID}" "$SNS_REG"
+
+# EFS: this phone's own Bluetooth and Wi-Fi addresses, strictly read-only (ro,noload: not even the journal is replayed).
+# Without bt_addr Bluetooth stays unconfigured; without wifi_mac the first boot runs with a random MAC and connman keeps the
+# network of the start wizard under that MAC.
+BT_ADDR=""; WIFI_MAC=""
+EFS_DIR=""; EFS_MNT=0
+if [ -f /efs/bluetooth/bt_addr ]; then
+    EFS_DIR=/efs
+else
+    for p in /dev/block/by-name/efs /dev/block/bootdevice/by-name/efs; do
+        [ -e "$p" ] || continue
+        mkdir -p /tmp/m52xq-efs
+        if mount -t ext4 -o ro,noload "$p" /tmp/m52xq-efs; then
+            EFS_DIR=/tmp/m52xq-efs; EFS_MNT=1
+        fi
+        break
+    done
+fi
+if [ -n "$EFS_DIR" ]; then
+    BT_ADDR=$(cat "$EFS_DIR/bluetooth/bt_addr" 2>/dev/null | tr -d ' \r\n')
+    WIFI_MAC=$(cat "$EFS_DIR/wifi/.mac.info" 2>/dev/null | tr -d ' \r\n')
+fi
+[ "$EFS_MNT" = 1 ] && umount /tmp/m52xq-efs
+rmdir /tmp/m52xq-efs 2>/dev/null
+mkdir -p "$R/etc/m52xq"
+if echo "$BT_ADDR" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
+    echo "$BT_ADDR" > "$R/etc/m52xq/bt_addr"
+    chmod 600 "$R/etc/m52xq/bt_addr"
+    ui_print "  Bluetooth address taken from this phone's EFS"
+else
+    ui_print "  WARNING: no Bluetooth address in EFS -- BT stays unconfigured"
+fi
+if echo "$WIFI_MAC" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
+    echo "$WIFI_MAC" > "$R/etc/m52xq/wifi_mac"
+    chmod 600 "$R/etc/m52xq/wifi_mac"
+    ui_print "  Wi-Fi address taken from this phone's EFS"
+else
+    ui_print "  WARNING: no Wi-Fi address in EFS -- the first boot may use a random one"
+fi
+
+# per phone identity
+cat /proc/sys/kernel/random/uuid | tr -d '-' > "$R/etc/machine-id"
+chmod 444 "$R/etc/machine-id"
+mkdir -p "$R/var/lib/dbus"
+[ -L "$R/var/lib/dbus/machine-id" ] || cp "$R/etc/machine-id" "$R/var/lib/dbus/machine-id"
+
+sync
+umount "$R"
+losetup -d "$P2_LOOP" 2>/dev/null
+
+next_step 0.03 1
+ui_print "- Done."
+ui_print "  boot.img written to $BOOT_PART"
+ui_print "  vendor_boot.img written to $VBOOT_PART"
+ui_print "  dtbo (dtbo-frag) written to $DTBO_PART"
+ui_print "  sailfishos-m52xq.img written to $SYSTEM_DEV"
+ui_print ""
+ui_print "  userdata was NOT touched."
+if [ -e /data/rootfs.img ]; then
+    ui_print ""
+    ui_print "  WARNING: /data/rootfs.img exists -- the phone boots THAT file,"
+    ui_print "  not this Sailfish system. Rename or remove it to boot Sailfish."
+fi
+ui_print ""
+ui_print ""
+exit 0

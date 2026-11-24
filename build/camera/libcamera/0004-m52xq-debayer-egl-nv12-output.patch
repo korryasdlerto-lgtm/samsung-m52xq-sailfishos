@@ -1,0 +1,292 @@
+From: korryasdlerto-lgtm
+Subject: [PATCH] m52xq: software ISP EGL debayer: NV12 output
+
+NV12 for video encoders without a CPU conversion: a luma pass (R8 target) and a half-size chroma
+pass (GR88 target at offset stride * height) with the same bayer shaders (OUTPUT_Y / OUTPUT_UV),
+BT.601 limited range. eGLImage::offset_ is now used for the DMA-BUF plane offset.
+---
+diff --git a/include/libcamera/internal/egl.h b/include/libcamera/internal/egl.h
+index d6fb6fe..2c265a4 100644
+--- a/include/libcamera/internal/egl.h
++++ b/include/libcamera/internal/egl.h
+@@ -63,7 +63,7 @@ public:
+ 	 */
+ 	eGLImage(GLint format, uint32_t width, uint32_t height, uint32_t stride, GLenum texture_unit, uint32_t texture_unit_uniform_id)
+ 		: format_(format), width_(width), height_(height), stride_(stride),
+-		  framesize_(stride * height),
++		  offset_(0), framesize_(stride * height),
+ 		  texture_unit_uniform_id_(texture_unit_uniform_id),
+ 		  texture_unit_(texture_unit)
+ 	{
+diff --git a/src/libcamera/egl.cpp b/src/libcamera/egl.cpp
+index ff9e54a..91ab3a8 100644
+--- a/src/libcamera/egl.cpp
++++ b/src/libcamera/egl.cpp
+@@ -200,7 +200,7 @@ int eGL::createDMABufTexture2D(eGLImage &eglImage, int fd, bool output)
+ 		EGL_HEIGHT, (EGLint)eglImage.height_,
+ 		EGL_LINUX_DRM_FOURCC_EXT, drm_format,
+ 		EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+-		EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
++		EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)eglImage.offset_,
+ 		EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)eglImage.stride_,
+ 		EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0,
+ 		EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0,
+diff --git a/src/libcamera/shaders/bayer_1x_packed.frag b/src/libcamera/shaders/bayer_1x_packed.frag
+index b9db053..78e862f 100644
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -307,7 +307,14 @@ void main(void)
+ 	/* Apply gamma after colour correction */
+ 	rgb = pow(rgb, vec3(gamma));
+ 
+-#if defined (SWAP_BLUE)
++#if defined (OUTPUT_Y)
++	/* NV12 luma (BT.601, limited range) */
++	gl_FragColor = vec4(16.0 / 255.0 + dot(rgb, vec3(0.2568, 0.5041, 0.0979)), 0.0, 0.0, 1.0);
++#elif defined (OUTPUT_UV)
++	/* NV12 chroma (BT.601, limited range): R = Cb, G = Cr of a GR88 render target */
++	gl_FragColor = vec4(128.0 / 255.0 + dot(rgb, vec3(-0.1482, -0.2910, 0.4392)),
++			    128.0 / 255.0 + dot(rgb, vec3(0.4392, -0.3678, -0.0714)), 0.0, 1.0);
++#elif defined (SWAP_BLUE)
+ 	gl_FragColor = vec4(rgb.bgr, 1.0);
+ #else
+ 	gl_FragColor = vec4(rgb, 1.0);
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index be2f89d..a40654d 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -161,7 +161,14 @@ void main(void) {
+     /* Apply gamma after colour correction */
+     rgb = pow(rgb, vec3(gamma));
+ 
+-#if defined (SWAP_BLUE)
++#if defined (OUTPUT_Y)
++	/* NV12 luma (BT.601, limited range) */
++	gl_FragColor = vec4(16.0 / 255.0 + dot(rgb, vec3(0.2568, 0.5041, 0.0979)), 0.0, 0.0, 1.0);
++#elif defined (OUTPUT_UV)
++	/* NV12 chroma (BT.601, limited range): R = Cb, G = Cr of a GR88 render target */
++	gl_FragColor = vec4(128.0 / 255.0 + dot(rgb, vec3(-0.1482, -0.2910, 0.4392)),
++			    128.0 / 255.0 + dot(rgb, vec3(0.4392, -0.3678, -0.0714)), 0.0, 1.0);
++#elif defined (SWAP_BLUE)
+     gl_FragColor = vec4(rgb.bgr, 1.0);
+ #else
+     gl_FragColor = vec4(rgb, 1.0);
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index df0d9c9..1083642 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -62,7 +62,9 @@ int DebayerEGL::getInputConfig(PixelFormat inputFormat, DebayerInputConfig &conf
+ 	std::vector<PixelFormat> outputFormats = { formats::XRGB8888,
+ 						   formats::ARGB8888,
+ 						   formats::XBGR8888,
+-						   formats::ABGR8888 };
++						   formats::ABGR8888,
++						   /* m52xq: NV12 straight for video encoders (no CPU conversion) */
++						   formats::NV12 };
+ 
+ 	if ((bayerFormat.bitDepth == 8 || bayerFormat.bitDepth == 10) &&
+ 	    bayerFormat.packing == BayerFormat::Packing::None &&
+@@ -158,10 +160,14 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 	 * Tell shaders how to re-order output taking account of how the pixels
+ 	 * are actually stored by EGL.
+ 	 */
++	nv12Output_ = false;
+ 	switch (outputFormat) {
+ 	case formats::ARGB8888:
+ 	case formats::XRGB8888:
+ 		break;
++	case formats::NV12:
++		nv12Output_ = true;
++		break;
+ 	case formats::ABGR8888:
+ 	case formats::XBGR8888:
+ 		egl_.pushEnv(shaderEnv, "#define SWAP_BLUE");
+@@ -249,6 +255,33 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 		break;
+ 	};
+ 
++	if (nv12Output_) {
++		std::vector<std::string> envY = shaderEnv;
++		std::vector<std::string> envUV = shaderEnv;
++		egl_.pushEnv(envY, "#define OUTPUT_Y");
++		egl_.pushEnv(envUV, "#define OUTPUT_UV");
++		if (buildProgram(programId_, vertexShaderData, fragmentShaderData, envY) ||
++		    buildProgram(programUVId_, vertexShaderData, fragmentShaderData, envUV))
++			return -ENODEV;
++	} else if (buildProgram(programId_, vertexShaderData, fragmentShaderData, shaderEnv)) {
++		return -ENODEV;
++	}
++
++	/* Ensure we set the programId_ */
++	glUseProgram(programId_);
++	err = glGetError();
++	if (err != GL_NO_ERROR) {
++		LOG(Debayer, Error) << "Use program error " << err;
++		return -ENODEV;
++	}
++
++	return getShaderVariableLocations();
++}
++
++int DebayerEGL::buildProgram(GLuint &program, std::span<const unsigned char> vertexShaderData,
++			     std::span<const unsigned char> fragmentShaderData,
++			     const std::vector<std::string> &shaderEnv)
++{
+ 	if (egl_.compileVertexShader(vertexShaderId_, vertexShaderData,
+ 				     shaderEnv)) {
+ 		LOG(Debayer, Error) << "Compile vertex shader fail";
+@@ -263,7 +296,7 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 	}
+ 	utils::scope_exit fShaderGuard([&] { glDeleteShader(fragmentShaderId_); });
+ 
+-	if (egl_.linkProgram(programId_, vertexShaderId_, fragmentShaderId_)) {
++	if (egl_.linkProgram(program, vertexShaderId_, fragmentShaderId_)) {
+ 		LOG(Debayer, Error) << "Linking program fail";
+ 		return -ENODEV;
+ 	}
+@@ -271,15 +304,7 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 	egl_.dumpShaderSource(vertexShaderId_);
+ 	egl_.dumpShaderSource(fragmentShaderId_);
+ 
+-	/* Ensure we set the programId_ */
+-	glUseProgram(programId_);
+-	err = glGetError();
+-	if (err != GL_NO_ERROR) {
+-		LOG(Debayer, Error) << "Use program error " << err;
+-		return -ENODEV;
+-	}
+-
+-	return getShaderVariableLocations();
++	return 0;
+ }
+ 
+ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+@@ -594,7 +619,7 @@ eGLImage *DebayerEGL::getCachedOutputFrameBuffer(FrameBuffer *output)
+ 			LOG(Debayer, Debug) << "Output cache " << outputBufferCount_ << " exceeded evicted entry";
+ 		}
+ 
+-		eglImageOutCache_.emplace_back(fd, std::make_unique<eGLImage>(GL_RGBA, outputSize_.width,
++		eglImageOutCache_.emplace_back(fd, std::make_unique<eGLImage>(nv12Output_ ? GL_RED : GL_RGBA, outputSize_.width,
+ 									      outputSize_.height, outputConfig_.stride, GL_TEXTURE1, 1));
+ 		eglImageOut = eglImageOutCache_.back().second.get();
+ 
+@@ -607,6 +632,36 @@ eGLImage *DebayerEGL::getCachedOutputFrameBuffer(FrameBuffer *output)
+ 	return eglImageOut;
+ }
+ 
++/*
++ * m52xq: the chroma plane of an NV12 output buffer: GR88 (R = Cb, G = Cr), half size, right after the luma plane
++ * (offset stride * height, the layout libcamerasrc extrapolates for NV12).
++ */
++eGLImage *DebayerEGL::getCachedOutputUVFrameBuffer(FrameBuffer *output)
++{
++	const SharedFD &fd = output->planes()[0].fd;
++
++	for (auto &[ifd, img] : eglImageOutUVCache_) {
++		if (ifd == fd)
++			return img.get();
++	}
++
++	if (eglImageOutUVCache_.size() >= outputBufferCount_)
++		eglImageOutUVCache_.pop_front();
++
++	auto img = std::make_unique<eGLImage>(GL_RG, outputSize_.width / 2, outputSize_.height / 2,
++					      outputConfig_.stride, GL_TEXTURE3, 3);
++	img->offset_ = outputConfig_.stride * outputSize_.height;
++	eglImageOutUVCache_.emplace_back(fd, std::move(img));
++	eGLImage *eglImageOut = eglImageOutUVCache_.back().second.get();
++
++	if (egl_.createOutputDMABufTexture2D(*eglImageOut, fd.get())) {
++		eglImageOutUVCache_.pop_back();
++		return nullptr;
++	}
++
++	return eglImageOut;
++}
++
+ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const DebayerParams &params, std::optional<MappedFrameBuffer> *inMapped, std::optional<DmaSyncer> *inDmaSyncer)
+ {
+ 	eGLImage *eglImageIn;
+@@ -619,6 +674,8 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const Debaye
+ 	if (!eglImageOut)
+ 		return -ENOMEM;
+ 
++	if (nv12Output_)
++		glUseProgram(programId_);
+ 	egl_.attachTextureToFBO(*eglImageOut);
+ 	setShaderVariableValues(*eglImageIn, params);
+ 
+@@ -628,6 +685,27 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const Debaye
+ 	glClear(GL_COLOR_BUFFER_BIT);
+ 	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
+ 
++	if (nv12Output_) {
++		/* m52xq: chroma pass at half size, its own program (same uniforms) */
++		eGLImage *eglImageOutUV = getCachedOutputUVFrameBuffer(output);
++		if (!eglImageOutUV)
++			return -ENOMEM;
++		GLuint programY = programId_;
++		programId_ = programUVId_;
++		glUseProgram(programId_);
++		getShaderVariableLocations();
++		egl_.attachTextureToFBO(*eglImageOutUV);
++		egl_.activateBindTexture(*eglImageIn);
++		setShaderVariableValues(*eglImageIn, params);
++		if (lscEnabled_ && eglImageLscLookup_)
++			glUniform1i(textureUniformLsc_, eglImageLscLookup_->texture_unit_uniform_id_);
++		glViewport(viewport.x / 2, viewport.y / 2, viewport.width / 2, viewport.height / 2);
++		glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++		programId_ = programY;
++		glUseProgram(programId_);
++		getShaderVariableLocations();
++	}
++
+ 	GLenum err = glGetError();
+ 	if (err != GL_NO_ERROR) {
+ 		LOG(eGL, Error) << "Drawing scene fail " << err;
+@@ -724,11 +802,16 @@ int DebayerEGL::start()
+ void DebayerEGL::stop()
+ {
+ 	eglImageOutCache_.clear();
++	eglImageOutUVCache_.clear();
+ 	eglImageInCache_.clear();
+ 
+ 	eglImageLscLookup_.reset();
+ 	lscLutVersion_.reset();
+ 
++	if (programUVId_) {
++		glDeleteProgram(programUVId_);
++		programUVId_ = 0;
++	}
+ 	if (programId_)
+ 		glDeleteProgram(programId_);
+ 
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index 067524e..53af601 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -12,7 +12,9 @@
+ #include <array>
+ #include <deque>
+ #include <memory>
++#include <span>
+ #include <stdint.h>
++#include <string>
+ #include <tuple>
+ #include <vector>
+ 
+@@ -78,6 +80,14 @@ private:
+ 	GLuint vertexShaderId_ = 0;
+ 	GLuint fragmentShaderId_ = 0;
+ 	GLuint programId_ = 0;
++	/* NV12 output: programId_ renders the luma plane, programUVId_ the chroma plane */
++	GLuint programUVId_ = 0;
++	bool nv12Output_ = false;
++	std::deque<std::pair<SharedFD, std::unique_ptr<eGLImage>>> eglImageOutUVCache_;
++	int buildProgram(GLuint &program, std::span<const unsigned char> vertexShaderData,
++			 std::span<const unsigned char> fragmentShaderData,
++			 const std::vector<std::string> &shaderEnv);
++	eGLImage *getCachedOutputUVFrameBuffer(FrameBuffer *output);
+ 
+ 	/* Pointer to object representing input texture */
+ 	std::deque<std::pair<SharedFD, std::unique_ptr<eGLImage>>> eglImageInCache_;

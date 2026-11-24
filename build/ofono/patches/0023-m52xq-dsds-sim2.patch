@@ -1,0 +1,594 @@
+From: Asdlerto Korry <korryasdlerto@gmail.com>
+Subject: [PATCH] qrtrqmi, qmimodem/sim: M52XQ dual SIM (DSDS) - second modem for subscription 1
+
+The SoC modem of the Samsung Galaxy M52 has two subscriptions behind one
+QRTR node. The udev modem (subscription 0) creates a second ofono modem for
+subscription 1 once it is powered. Each modem binds its NAS, VOICE and WMS
+clients to its subscription; the SIM driver gets the subscription as vendor
+and uses the primary / secondary GW provisioning session, the matching card
+status index and the PIN card session of its slot. IMSI of SIM 2 is read from
+EF IMSI. The data path (IPA, gprs, lte) and the modem operating mode stay
+with the first modem. The slot driver registers two slots.
+---
+--- a/plugins/qrtrqmi.c	2026-11-15 02:08:51.873089520 +0200
++++ b/plugins/qrtrqmi.c	2026-11-15 02:09:52.429426820 +0200
+@@ -53,12 +53,32 @@
+ 	struct qmi_service *dms;
+ 	struct qmi_service *dpm;
+ 	struct qmi_service *wda;
++	struct qmi_service *bind_nas;
++	struct qmi_service *bind_voice;
++	struct qmi_service *bind_wms;
+ 	int main_net_ifindex;
+ 	char main_net_name[IFNAMSIZ];
++	int subscription;
+ 	bool have_voice : 1;
+ };
+ 
+ /*
++ * M52XQ DSDS: the SoC modem has two subscriptions (SIM 1, SIM 2) behind the
++ * same QRTR node. The udev modem (subscription 0) creates a second ofono
++ * modem for subscription 1; each modem has its own QMI clients, bound to its
++ * subscription (NAS, VOICE, WMS Bind Subscription), and its own UIM session
++ * (primary / secondary GW provisioning). The data path (IPA, gprs, lte)
++ * stays with the first modem.
++ */
++#define QRTRQMI_MAX_SUBS		2
++#define QMI_NAS_BIND_SUBSCRIPTION	0x0045
++#define QMI_VOICE_BIND_SUBSCRIPTION	0x0044
++#define QMI_WMS_BIND_SUBSCRIPTION	0x004c
++#define QMI_BIND_PARAM_SUBSCRIPTION	0x01
++
++static struct ofono_modem *qrtrqmi_sub1_modem;
++
++/*
+  * Slot driver for the Sailfish slot manager. A QRTR modem is built into the
+  * SoC, so there is exactly one slot. It is added once the IMEI is known and
+  * then follows the SIM atom, so that org.nemomobile.ofono.ModemManager (the
+@@ -70,19 +90,25 @@
+ 	WATCH_HANDLER_COUNT
+ };
+ 
+-struct ofono_slot_driver_data {
+-	struct ofono_slot_manager *manager;
++struct qrtrqmi_slot {
+ 	struct ofono_slot *slot;
+ 	struct ofono_watch *watch;
+ 	unsigned long watch_id[WATCH_HANDLER_COUNT];
+ };
+ 
++struct ofono_slot_driver_data {
++	struct ofono_slot_manager *manager;
++	struct qrtrqmi_slot s[QRTRQMI_MAX_SUBS];
++	bool started;
++};
++
+ static struct ofono_slot_driver_data qrtrqmi_slots;
+ static struct ofono_slot_driver_reg *qrtrqmi_slot_reg;
+ 
+-static enum ofono_slot_sim_presence qrtrqmi_sim_presence(void)
++static enum ofono_slot_sim_presence qrtrqmi_sim_presence(
++						struct qrtrqmi_slot *qs)
+ {
+-	struct ofono_watch *w = qrtrqmi_slots.watch;
++	struct ofono_watch *w = qs->watch;
+ 
+ 	/* The qmimodem SIM atom is registered once the card status is known */
+ 	if (!w || !w->sim)
+@@ -104,36 +130,61 @@
+ 
+ static void qrtrqmi_sim_changed(struct ofono_watch *w, void *user_data)
+ {
+-	ofono_slot_set_sim_presence(qrtrqmi_slots.slot,
+-						qrtrqmi_sim_presence());
++	struct qrtrqmi_slot *qs = user_data;
++
++	ofono_slot_set_sim_presence(qs->slot, qrtrqmi_sim_presence(qs));
++}
++
++static bool qrtrqmi_all_slots_added(void)
++{
++	int i;
++
++	for (i = 0; i < QRTRQMI_MAX_SUBS; i++)
++		if (!qrtrqmi_slots.s[i].slot)
++			return false;
++
++	return true;
+ }
+ 
+ static void qrtrqmi_slot_add(struct ofono_modem *modem, const char *imei)
+ {
+ 	const char *path = ofono_modem_get_path(modem);
++	struct qrtrqmi_data *data = ofono_modem_get_data(modem);
++	struct qrtrqmi_slot *qs;
+ 	struct ofono_watch *w;
+ 
+-	if (!qrtrqmi_slots.manager || qrtrqmi_slots.slot)
++	if (!data || data->subscription < 0 ||
++				data->subscription >= QRTRQMI_MAX_SUBS)
++		return;
++
++	qs = &qrtrqmi_slots.s[data->subscription];
++
++	if (!qrtrqmi_slots.manager || qs->slot)
+ 		return;
+ 
+-	DBG("%s", path);
++	DBG("%s subscription %d", path, data->subscription);
+ 
+-	w = qrtrqmi_slots.watch = ofono_watch_new(path);
+-	qrtrqmi_slots.watch_id[WATCH_HANDLER_SIM] =
++	w = qs->watch = ofono_watch_new(path);
++	qs->watch_id[WATCH_HANDLER_SIM] =
+ 		ofono_watch_add_sim_changed_handler(w,
+-					qrtrqmi_sim_changed, NULL);
+-	qrtrqmi_slots.watch_id[WATCH_HANDLER_SIM_STATE] =
++					qrtrqmi_sim_changed, qs);
++	qs->watch_id[WATCH_HANDLER_SIM_STATE] =
+ 		ofono_watch_add_sim_state_changed_handler(w,
+-					qrtrqmi_sim_changed, NULL);
++					qrtrqmi_sim_changed, qs);
+ 
+-	qrtrqmi_slots.slot = ofono_slot_add(qrtrqmi_slots.manager, path,
++	qs->slot = ofono_slot_add(qrtrqmi_slots.manager, path,
+ 				OFONO_RADIO_ACCESS_MODE_GSM |
+ 				OFONO_RADIO_ACCESS_MODE_UMTS |
+ 				OFONO_RADIO_ACCESS_MODE_LTE,
+-				imei, "00", qrtrqmi_sim_presence(),
++				imei, data->subscription ? "01" : "00",
++				qrtrqmi_sim_presence(qs),
+ 				OFONO_SLOT_NO_FLAGS);
+ 
+-	ofono_slot_driver_started(qrtrqmi_slot_reg);
++	/* The slot manager waits until both SIM slots are known */
++	if (!qrtrqmi_slots.started && qrtrqmi_all_slots_added()) {
++		qrtrqmi_slots.started = true;
++		ofono_slot_driver_started(qrtrqmi_slot_reg);
++	}
+ }
+ 
+ static struct ofono_slot_driver_data *qrtrqmi_slot_init(
+@@ -145,15 +196,27 @@
+ 
+ static unsigned int qrtrqmi_slot_start(struct ofono_slot_driver_data *d)
+ {
+-	/* Keep the slot manager waiting until the slot has been added */
+-	return d->slot ? 0 : 1;
++	/* Keep the slot manager waiting until the slots have been added */
++	if (qrtrqmi_all_slots_added()) {
++		d->started = true;
++		return 0;
++	}
++
++	return 1;
+ }
+ 
+ static void qrtrqmi_slot_cleanup(struct ofono_slot_driver_data *d)
+ {
+-	ofono_watch_remove_all_handlers(d->watch, d->watch_id);
+-	ofono_watch_unref(d->watch);
+-	ofono_slot_unref(d->slot);
++	int i;
++
++	for (i = 0; i < QRTRQMI_MAX_SUBS; i++) {
++		struct qrtrqmi_slot *qs = &d->s[i];
++
++		ofono_watch_remove_all_handlers(qs->watch, qs->watch_id);
++		ofono_watch_unref(qs->watch);
++		ofono_slot_unref(qs->slot);
++	}
++
+ 	memset(d, 0, sizeof(*d));
+ }
+ 
+@@ -239,6 +302,7 @@
+ 	l_strlcpy(data->main_net_name,
+ 			ofono_modem_get_string(modem, "NetworkInterface"),
+ 			sizeof(data->main_net_name));
++	data->subscription = ofono_modem_get_integer(modem, "Subscription");
+ 	ofono_modem_set_data(modem, data);
+ 	ofono_modem_set_capabilities(modem, OFONO_MODEM_CAPABILITY_LTE);
+ 
+@@ -251,6 +315,12 @@
+ 
+ static void qrtrqmi_deinit(struct qrtrqmi_data *data)
+ {
++	qmi_service_free(data->bind_nas);
++	data->bind_nas = NULL;
++	qmi_service_free(data->bind_voice);
++	data->bind_voice = NULL;
++	qmi_service_free(data->bind_wms);
++	data->bind_wms = NULL;
+ 	qmi_service_free(data->dms);
+ 	data->dms = NULL;
+ 	qmi_service_free(data->dpm);
+@@ -269,10 +339,117 @@
+ 
+ 	ofono_modem_set_data(modem, NULL);
+ 
++	if (data->subscription == 0 && qrtrqmi_sub1_modem) {
++		struct ofono_modem *sub1 = qrtrqmi_sub1_modem;
++
++		qrtrqmi_sub1_modem = NULL;
++		ofono_modem_remove(sub1);
++	} else if (data->subscription == 1 && qrtrqmi_sub1_modem == modem)
++		qrtrqmi_sub1_modem = NULL;
++
+ 	qrtrqmi_deinit(data);
+ 	l_free(data);
+ }
+ 
++static void bind_subscription_cb(struct qmi_result *result, void *user_data)
++{
++	const char *what = user_data;
++	uint16_t error;
++
++	if (qmi_result_set_error(result, &error))
++		ofono_warn("%s bind subscription failed: %d", what, error);
++	else
++		DBG("%s bind subscription done", what);
++}
++
++static struct qmi_service *bind_subscription(struct qrtrqmi_data *data,
++				uint32_t type, uint16_t message,
++				const char *what)
++{
++	struct qmi_service *service;
++	struct qmi_param *param;
++
++	service = qmi_qrtr_node_get_service(data->node, type);
++	if (!service)
++		return NULL;
++
++	param = qmi_param_new_uint8(QMI_BIND_PARAM_SUBSCRIPTION,
++					data->subscription);
++
++	if (!qmi_service_send(service, message, param,
++				bind_subscription_cb, (void *) what, NULL))
++		qmi_param_free(param);
++
++	return service;
++}
++
++/*
++ * Bind the shared NAS, VOICE and WMS clients of this node to the
++ * subscription before any atom uses them (requests on a client are sent in
++ * order, so the atoms' first requests already see the binding).
++ */
++static void bind_subscriptions(struct qrtrqmi_data *data)
++{
++	DBG("subscription %d", data->subscription);
++
++	data->bind_nas = bind_subscription(data, QMI_SERVICE_NAS,
++				QMI_NAS_BIND_SUBSCRIPTION, "NAS");
++	data->bind_voice = bind_subscription(data, QMI_SERVICE_VOICE,
++				QMI_VOICE_BIND_SUBSCRIPTION, "VOICE");
++	data->bind_wms = bind_subscription(data, QMI_SERVICE_WMS,
++				QMI_WMS_BIND_SUBSCRIPTION, "WMS");
++}
++
++/* Second modem for SIM 2, created once the first one is powered */
++static void qrtrqmi_create_sub1(struct ofono_modem *modem)
++{
++	static const char *strings[] = {
++		"NetworkInterfaceKernelDriver", "NetworkInterface", "Bus",
++	};
++	struct ofono_modem *sub1;
++	char *name;
++	unsigned int i;
++
++	if (qrtrqmi_sub1_modem)
++		return;
++
++	name = l_strdup_printf("%s", ofono_modem_get_path(modem) + 1);
++	if (l_str_has_suffix(name, "_0"))
++		name[strlen(name) - 1] = '1';
++	else {
++		char *n = l_strdup_printf("%s_1", name);
++
++		l_free(name);
++		name = n;
++	}
++
++	sub1 = ofono_modem_create(name, "qrtrqmi");
++	l_free(name);
++	if (!sub1) {
++		ofono_error("Unable to create the SIM 2 modem");
++		return;
++	}
++
++	for (i = 0; i < L_ARRAY_SIZE(strings); i++)
++		ofono_modem_set_string(sub1, strings[i],
++				ofono_modem_get_string(modem, strings[i]));
++
++	ofono_modem_set_integer(sub1, "NetworkInterfaceIndex",
++			ofono_modem_get_integer(modem,
++					"NetworkInterfaceIndex"));
++	ofono_modem_set_integer(sub1, "Subscription", 1);
++	ofono_modem_set_powered_timeout_hint(sub1, 30);
++
++	if (ofono_modem_register(sub1) < 0) {
++		ofono_error("Unable to register the SIM 2 modem");
++		ofono_modem_remove(sub1);
++		return;
++	}
++
++	qrtrqmi_sub1_modem = sub1;
++	DBG("SIM 2 modem %s", ofono_modem_get_path(sub1));
++}
++
+ static void power_reset_cb(struct qmi_result *result, void *user_data)
+ {
+ 	struct ofono_modem *modem = user_data;
+@@ -529,10 +706,22 @@
+ 
+ 	data->dms = qmi_qrtr_node_get_service(node, QMI_SERVICE_DMS);
+ 
+-	if (!qrtrqmi_slots.slot)
++	bind_subscriptions(data);
++
++	if (data->subscription >= 0 && data->subscription < QRTRQMI_MAX_SUBS &&
++				!qrtrqmi_slots.s[data->subscription].slot)
+ 		qmi_service_send(data->dms, QMI_DMS_GET_IDS, NULL,
+ 					get_ids_cb, modem, NULL);
+ 
++	/*
++	 * SIM 2: the operating mode of the modem (and the data path) belong
++	 * to the first modem; resetting it here would take SIM 1 offline.
++	 */
++	if (data->subscription) {
++		ofono_modem_set_powered(modem, TRUE);
++		return;
++	}
++
+ 	if (setup_data_path(modem) == 0)
+ 		return;
+ 
+@@ -585,6 +774,11 @@
+ 
+ 	DBG("%p", modem);
+ 
++	if (data->subscription) {
++		qrtrqmi_deinit(data);
++		return 0;
++	}
++
+ 	param = qmi_param_new_uint8(QMI_DMS_PARAM_OPER_MODE,
+ 					QMI_DMS_OPER_MODE_LOW_POWER);
+ 
+@@ -619,6 +813,13 @@
+ 
+ 	DBG("%p %s", modem, online ? "online" : "offline");
+ 
++	/* SIM 2 going offline must not switch the radio off for SIM 1 */
++	if (data->subscription && !online) {
++		CALLBACK_WITH_SUCCESS(cb, cbd->data);
++		l_free(cbd);
++		return;
++	}
++
+ 	param = qmi_param_new_uint8(QMI_DMS_PARAM_OPER_MODE,
+ 					online ? QMI_DMS_OPER_MODE_ONLINE :
+ 						QMI_DMS_OPER_MODE_LOW_POWER);
+@@ -642,7 +843,8 @@
+ 	ofono_devinfo_create(modem, 0, "qmimodem",
+ 			qmi_qrtr_node_get_service(node, QMI_SERVICE_DMS));
+ 
+-	ofono_sim_create(modem, 0, "qmimodem",
++	/* vendor = subscription: the UIM session of the SIM driver */
++	ofono_sim_create(modem, data->subscription, "qmimodem",
+ 			qmi_qrtr_node_get_service(node, QMI_SERVICE_DMS),
+ 			qmi_qrtr_node_get_service(node, QMI_SERVICE_UIM));
+ 
+@@ -651,6 +853,9 @@
+ 		data->have_voice = true;
+ 		ofono_voicecall_create(modem, 0, "qmimodem", voice);
+ 	}
++
++	if (data->subscription == 0)
++		qrtrqmi_create_sub1(modem);
+ }
+ 
+ static int setup_gprs_context(uint8_t mux_id, const char *interface,
+@@ -724,7 +929,8 @@
+ 
+ 	DBG("%p", modem);
+ 
+-	ofono_lte_create(modem, 0, "qmimodem",
++	if (data->subscription == 0)
++		ofono_lte_create(modem, 0, "qmimodem",
+ 			qmi_qrtr_node_get_service(node, QMI_SERVICE_WDS));
+ 
+ 	ofono_radio_settings_create(modem, 0, "qmimodem",
+@@ -744,7 +950,9 @@
+ 			ofono_message_waiting_register(mw);
+ 	}
+ 
+-	setup_gprs(modem);
++	/* Mobile data (IPA, rmnet) stays with SIM 1 */
++	if (data->subscription == 0)
++		setup_gprs(modem);
+ }
+ 
+ static void qrtrqmi_post_online(struct ofono_modem *modem)
+--- a/drivers/qmimodem/sim.c	2026-11-15 02:08:51.877089542 +0200
++++ b/drivers/qmimodem/sim.c	2026-11-15 02:10:42.749685369 +0200
+@@ -48,6 +48,8 @@
+ 	struct qmi_service *uim;
+ 	uint32_t event_mask;
+ 	uint8_t app_type;
++	uint8_t session;		/* UIM session type of this SIM */
++	bool secondary;			/* M52XQ DSDS: SIM 2 (subscription 1) */
+ 	uint32_t retry_count;
+ 	struct l_timeout *retry_timer;
+ };
+@@ -151,7 +153,7 @@
+ {
+ 	struct sim_data *data = ofono_sim_get_data(sim);
+ 	struct cb_data *cbd = cb_data_new(cb, user_data);
+-	unsigned char aid_data[2] = { 0x00, 0x00 };
++	unsigned char aid_data[2] = { data->session, 0x00 };
+ 	unsigned char fileid_data[9];
+ 	int fileid_len;
+ 	struct qmi_param *param;
+@@ -213,7 +215,7 @@
+ {
+ 	struct sim_data *data = ofono_sim_get_data(sim);
+ 	struct cb_data *cbd = cb_data_new(cb, user_data);
+-	unsigned char aid_data[2] = { 0x00, 0x00 };
++	unsigned char aid_data[2] = { data->session, 0x00 };
+ 	unsigned char read_data[4];
+ 	unsigned char fileid_data[9];
+ 	int fileid_len;
+@@ -256,7 +258,7 @@
+ {
+ 	struct sim_data *data = ofono_sim_get_data(sim);
+ 	struct cb_data *cbd = cb_data_new(cb, user_data);
+-	unsigned char aid_data[2] = { 0x00, 0x00 };
++	unsigned char aid_data[2] = { data->session, 0x00 };
+ 	unsigned char read_data[4];
+ 	unsigned char fileid_data[9];
+ 	int fileid_len;
+@@ -336,7 +338,7 @@
+ {
+ 	struct sim_data *data = ofono_sim_get_data(sim);
+ 	struct cb_data *cbd = cb_data_new(cb, user_data);
+-	unsigned char aid_data[2] = { 0x00, 0x00 };
++	unsigned char aid_data[2] = { data->session, 0x00 };
+ 	unsigned char write_data[4 + length];
+ 	unsigned char fileid_data[9];
+ 	int fileid_len;
+@@ -438,10 +440,18 @@
+ 
+ 	DBG("");
+ 
++	/*
++	 * DMS Get IMSI only knows the primary subscription; for SIM 2 fail,
++	 * so that the core reads EF IMSI through this UIM session instead.
++	 */
++	if (data->secondary)
++		goto error;
++
+ 	if (qmi_service_send(data->dms, QMI_DMS_GET_IMSI, NULL,
+ 					get_imsi_cb, cbd, l_free) > 0)
+ 		return;
+ 
++error:
+ 	CALLBACK_WITH_FAILURE(cb, NULL, cbd->data);
+ 
+ 	l_free(cbd);
+@@ -496,7 +506,8 @@
+ }
+ 
+ static enum get_card_status_result handle_get_card_status_data(
+-		struct qmi_result *result, struct sim_status *sim_stat)
++		struct qmi_result *result, struct sim_status *sim_stat,
++		bool secondary)
+ {
+ 	const void *ptr;
+ 	const struct qmi_uim_card_status *status;
+@@ -530,7 +541,9 @@
+ 			info2 = ptr + offset;
+ 			offset += sizeof(struct qmi_uim_app_info2);
+ 
+-			index = L_LE16_TO_CPU(status->index_gw_pri);
++			index = L_LE16_TO_CPU(secondary ?
++						status->index_gw_sec :
++						status->index_gw_pri);
+ 
+ 			if ((index & 0xff) == n && (index >> 8) == i) {
+ 				if (get_card_status(slot, info1, info2,
+@@ -547,12 +560,13 @@
+ }
+ 
+ static enum get_card_status_result handle_get_card_status_result(
+-		struct qmi_result *result, struct sim_status *sim_stat)
++		struct qmi_result *result, struct sim_status *sim_stat,
++		bool secondary)
+ {
+ 	if (qmi_result_set_error(result, NULL))
+ 		return GET_CARD_STATUS_RESULT_ERROR;
+ 
+-	return handle_get_card_status_data(result, sim_stat);
++	return handle_get_card_status_data(result, sim_stat, secondary);
+ }
+ 
+ static void query_passwd_state_cb(struct qmi_result *result, void *user_data);
+@@ -589,7 +603,8 @@
+ 	for (i = 0; i < OFONO_SIM_PASSWORD_INVALID; i++)
+ 		sim_stat.retries[i] = -1;
+ 
+-	res = handle_get_card_status_result(result, &sim_stat);
++	res = handle_get_card_status_result(result, &sim_stat,
++							data->secondary);
+ 	if (res == GET_CARD_STATUS_RESULT_TEMP_ERROR &&
+ 			++data->retry_count <= MAX_RETRY_COUNT) {
+ 		DBG("Retry command");
+@@ -657,6 +672,7 @@
+ {
+ 	struct cb_data *cbd = user_data;
+ 	ofono_sim_pin_retries_cb_t cb = cbd->cb;
++	struct sim_data *data = ofono_sim_get_data(cbd->user);
+ 	struct sim_status sim_stat;
+ 	unsigned int i;
+ 
+@@ -665,7 +681,8 @@
+ 	for (i = 0; i < OFONO_SIM_PASSWORD_INVALID; i++)
+ 		sim_stat.retries[i] = -1;
+ 
+-	if (handle_get_card_status_result(result, &sim_stat) !=
++	if (handle_get_card_status_result(result, &sim_stat,
++						data->secondary) !=
+ 					GET_CARD_STATUS_RESULT_OK) {
+ 		CALLBACK_WITH_FAILURE(cb, NULL, cbd->data);
+ 		return;
+@@ -682,6 +699,8 @@
+ 
+ 	DBG("");
+ 
++	cbd->user = sim;
++
+ 	if (qmi_service_send(data->uim, QMI_UIM_GET_CARD_STATUS, NULL,
+ 					query_pin_retries_cb, cbd, l_free) > 0)
+ 		return;
+@@ -736,7 +755,8 @@
+ 	qmi_param_append(param, QMI_UIM_PARAM_MESSAGE_INFO, 2 + passwd_len,
+ 					info_data);
+ 	/* param Session Information */
+-	session_info_data[0] = 0x6;
++	/* PIN 1 lives on the card: card session of slot 1 / slot 2 */
++	session_info_data[0] = data->secondary ? 0x7 : 0x6;
+ 	session_info_data[1] = 0x0;
+ 	qmi_param_append(param, QMI_UIM_PARAM_MESSAGE_SESSION_INFO, 2,
+ 					session_info_data);
+@@ -760,7 +780,8 @@
+ 
+ 	DBG("");
+ 
+-	if (handle_get_card_status_result(result, &sim_stat) !=
++	if (handle_get_card_status_result(result, &sim_stat,
++						data->secondary) !=
+ 					GET_CARD_STATUS_RESULT_OK) {
+ 		data->app_type = 0;	/* Unknown */
+ 		sim_stat.card_state = 0x00;	/* Absent */
+@@ -789,7 +810,8 @@
+ 
+ 	DBG("");
+ 
+-	if (handle_get_card_status_data(result, &sim_stat) !=
++	if (handle_get_card_status_data(result, &sim_stat,
++						data->secondary) !=
+ 					GET_CARD_STATUS_RESULT_OK) {
+ 		data->app_type = 0;	/* Unknown */
+ 		sim_stat.card_state = 0x00;	/* Absent */
+@@ -860,6 +882,9 @@
+ 	data = l_new(struct sim_data, 1);
+ 	data->uim = uim;
+ 	data->dms = dms;
++	/* vendor = subscription (qrtrqmi DSDS): secondary GW provisioning */
++	data->secondary = vendor == 1;
++	data->session = data->secondary ? 0x02 : 0x00;
+ 
+ 	ofono_sim_set_data(sim, data);
+ 

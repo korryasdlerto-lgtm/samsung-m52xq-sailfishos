@@ -1,0 +1,19 @@
+#!/bin/sh
+# m52xq (Sailfish): give wlan0 this phone's own MAC. ath11k gets no address from the board data and invents a random one on every
+# boot; connman keys its saved Wi-Fi services by the MAC (wifi_<mac>_<ssid>_…), so after every reboot no network was known and
+# Wi-Fi stayed off (2026-11-14). The address comes from Samsung EFS wifi/.mac.info, copied to /etc/m52xq/wifi_mac by the installer.
+# Run by udev when the interface is added (still down).
+dev=${1:-wlan0}
+f=/etc/m52xq/wifi_mac
+# no file yet (fresh install): read the address from EFS once, read-only, and keep it
+if [ ! -s $f ] && [ -e /dev/disk/by-partlabel/efs ]; then
+	m=$(mktemp -d) && mount -o ro,noload /dev/disk/by-partlabel/efs $m 2>/dev/null && {
+		mkdir -p /etc/m52xq && tr -d ' \n' < $m/wifi/.mac.info > $f.new 2>/dev/null && mv $f.new $f && chmod 600 $f
+		umount $m
+	}
+	rmdir $m 2>/dev/null
+fi
+[ -r $f ] || exit 0
+mac=$(tr -d ' \n' < $f)
+echo "$mac" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$' || exit 0
+PATH=/usr/sbin:/usr/bin:/sbin:/bin ip link set dev "$dev" address "$mac"

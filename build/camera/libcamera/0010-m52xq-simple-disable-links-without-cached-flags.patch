@@ -1,0 +1,44 @@
+From: Asdlerto Korry <korryasdlerto@gmail.com>
+Subject: [PATCH] m52xq: simple: set up pipeline links without trusting the cached flags
+
+A second libcamera instance (libcamerasrc in Snapshot for 4K next to
+wireplumber) changes links behind the back of the first one, so the
+cached MEDIA_LNK_FL_ENABLED is stale: an old link stays enabled and camss
+returns -EBUSY for the new one (msm_csiphy3 -> msm_csid0), or a needed
+link is not re-enabled. Always disable the other non-immutable links and
+always enable the pipeline link (the kernel ignores unchanged flags).
+---
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -798,8 +798,16 @@
+ 				if (link == sinkLink)
+ 					continue;
+ 
+-				if ((link->flags() & MEDIA_LNK_FL_ENABLED) &&
+-				    !(link->flags() & MEDIA_LNK_FL_IMMUTABLE)) {
++				/*
++				 * m52xq: do not trust the cached ENABLED flag. Another
++				 * libcamera instance (libcamerasrc in an application next
++				 * to the one in wireplumber) may have enabled a link on
++				 * this entity since our media graph was enumerated: the
++				 * cache still says "disabled", the link stays on and camss
++				 * refuses the new one (csid link_setup: -EBUSY). Disabling
++				 * an already disabled link is a no-op in the kernel.
++				 */
++				if (!(link->flags() & MEDIA_LNK_FL_IMMUTABLE)) {
+ 					ret = link->setEnabled(false);
+ 					if (ret < 0)
+ 						return ret;
+@@ -807,7 +815,11 @@
+ 			}
+ 		}
+ 
+-		if (!(sinkLink->flags() & MEDIA_LNK_FL_ENABLED)) {
++		/*
++		 * m52xq: enable the pipeline link even when the cache says it is
++		 * enabled - another libcamera instance may have disabled it.
++		 */
++		if (!(sinkLink->flags() & MEDIA_LNK_FL_IMMUTABLE)) {
+ 			ret = sinkLink->setEnabled(true);
+ 			if (ret < 0)
+ 				return ret;

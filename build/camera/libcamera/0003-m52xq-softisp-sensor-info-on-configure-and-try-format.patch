@@ -1,0 +1,72 @@
+From: korryasdlerto-lgtm
+Subject: [PATCH] m52xq: soft IPA gets the sensor info of the configured mode; try formats do not touch the active sensor mode
+
+The soft IPA kept the IPACameraSensorInfo of init() (the mode the sensor was left in by the
+previous user): after another camera the s5kgw3 stayed in 9248x6936 and the 4K stream was
+limited to 10 fps. The simple pipeline set the ACTIVE sensor format while enumerating with
+TryFormat.
+---
+diff --git a/include/libcamera/ipa/softisp.mojom b/include/libcamera/ipa/softisp.mojom
+index e42742e..af689f7 100644
+--- a/include/libcamera/ipa/softisp.mojom
++++ b/include/libcamera/ipa/softisp.mojom
+@@ -10,6 +10,7 @@ import "include/libcamera/ipa/core.mojom";
+ 
+ struct IPAConfigInfo {
+ 	libcamera.ControlInfoMap sensorControls;
++	libcamera.IPACameraSensorInfo sensorInfo;
+ };
+ 
+ interface IPASoftIspInterface {
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index 00249a3..f597bcd 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -192,6 +192,9 @@ int IPASoftIsp::init(const IPASettings &settings,
+ int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaControls)
+ {
+ 	context_.sensorControls = configInfo.sensorControls;
++	/* The sensor info of the configured mode (init() had the mode the sensor was left in). */
++	if (configInfo.sensorInfo.outputSize.width && configInfo.sensorInfo.pixelRate)
++		context_.sensorInfo = configInfo.sensorInfo;
+ 
+ 	/* Clear the IPA context before the streaming session. */
+ 	context_.configuration = {};
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 35e0664..a63ff3e 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -830,7 +830,15 @@ int SimpleCameraData::setupFormats(V4L2SubdeviceFormat *format,
+ 	 * Configure the format on the sensor output and propagate it through
+ 	 * the pipeline.
+ 	 */
+-	ret = sensor_->setFormat(format, transform);
++	/*
++	 * A try format must not change the active format of the sensor:
++	 * enumerating the configurations otherwise leaves the sensor in the
++	 * last tried mode.
++	 */
++	if (whence == V4L2Subdevice::TryFormat)
++		ret = sensor_->tryFormat(format);
++	else
++		ret = sensor_->setFormat(format, transform);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1652,6 +1660,16 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
+ 	} else {
+ 		ipa::softisp::IPAConfigInfo configInfo;
+ 		configInfo.sensorControls = data->sensor_->controls();
++		/*
++		 * The sensor mode was just set: give the IPA the sensor info of this
++		 * mode, the one from init() describes whatever mode the sensor was
++		 * left in (frame duration limits computed with the wrong line length
++		 * and height).
++		 */
++		ret = data->sensor_->sensorInfo(&configInfo.sensorInfo);
++		if (ret)
++			LOG(SimplePipeline, Warning)
++				<< "Failed to get the sensor info: " << ret;
+ 		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo, &data->controlInfo_);
+ 	}
+ }

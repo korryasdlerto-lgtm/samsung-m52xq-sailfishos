@@ -1,0 +1,18 @@
+[Unit]
+Description=M52XQ: /home on the userdata partition
+DefaultDependencies=no
+RequiresMountsFor=/mnt/userdata
+After=local-fs.target mnt-userdata.mount
+# connman (StorageRoot=/home/.system/var/lib), sailjaild and the user session (defaultuser is created at the first
+# start by start-autologin) must see the final /home. Not before sysinit.target: a delayed sysinit.target lets
+# systemd-tmpfiles-setup run a second time, which empties /run/systemd/boot-status (no user session)
+Before=connman.service connman-vpn.service sailjaild.service oneshot-root.service systemd-user-sessions.service start-user-session.service
+ConditionPathExists=/dev/disk/by-partlabel/userdata
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/m52xq-home-on-userdata
+
+[Install]
+WantedBy=multi-user.target

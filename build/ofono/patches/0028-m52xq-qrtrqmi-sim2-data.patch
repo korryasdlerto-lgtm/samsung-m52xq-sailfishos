@@ -1,0 +1,182 @@
+M52XQ: qrtrqmi: mobile data on SIM 2 (subscription 1)
+
+gprs atoms for both subscriptions: every WDS client is bound to its subscription (0x00AF, u32, 1 = SIM 1, 2 = SIM 2), the
+premux links are shared, the NAS serving system (ignores the binding) is not used for SIM 2 and an explicit attach is not
+requested there. The modem data subscription (DDS) is switched outside ofono (m52xq-dds).
+
+--- a/plugins/qrtrqmi.c
++++ b/plugins/qrtrqmi.c
+@@ -56,6 +56,7 @@
+ 	struct qmi_service *bind_nas;
+ 	struct qmi_service *bind_voice;
+ 	struct qmi_service *bind_wms;
++	struct qmi_service *bind_wds;
+ 	int main_net_ifindex;
+ 	char main_net_name[IFNAMSIZ];
+ 	int subscription;
+@@ -74,6 +75,7 @@
+ #define QMI_NAS_BIND_SUBSCRIPTION	0x0045
+ #define QMI_VOICE_BIND_SUBSCRIPTION	0x0044
+ #define QMI_WMS_BIND_SUBSCRIPTION	0x004c
++#define QMI_WDS_BIND_SUBSCRIPTION	0x00af	/* u32: subscription + 1 */
+ #define QMI_BIND_PARAM_SUBSCRIPTION	0x01
+ 
+ static struct ofono_modem *qrtrqmi_sub1_modem;
+@@ -321,6 +323,8 @@
+ 	data->bind_voice = NULL;
+ 	qmi_service_free(data->bind_wms);
+ 	data->bind_wms = NULL;
++	qmi_service_free(data->bind_wds);
++	data->bind_wds = NULL;
+ 	qmi_service_free(data->dms);
+ 	data->dms = NULL;
+ 	qmi_service_free(data->dpm);
+@@ -383,6 +387,22 @@
+ 	return service;
+ }
+ 
++/* WDS: the subscription is a 32 bit value, 1 = primary, 2 = secondary */
++static void bind_wds(struct qrtrqmi_data *data, struct qmi_service *service)
++{
++	struct qmi_param *param;
++
++	if (!service)
++		return;
++
++	param = qmi_param_new_uint32(QMI_BIND_PARAM_SUBSCRIPTION,
++					data->subscription + 1);
++
++	if (!qmi_service_send(service, QMI_WDS_BIND_SUBSCRIPTION, param,
++				bind_subscription_cb, (void *) "WDS", NULL))
++		qmi_param_free(param);
++}
++
+ /*
+  * Bind the shared NAS, VOICE and WMS clients of this node to the
+  * subscription before any atom uses them (requests on a client are sent in
+@@ -398,6 +418,8 @@
+ 				QMI_VOICE_BIND_SUBSCRIPTION, "VOICE");
+ 	data->bind_wms = bind_subscription(data, QMI_SERVICE_WMS,
+ 				QMI_WMS_BIND_SUBSCRIPTION, "WMS");
++	data->bind_wds = qmi_qrtr_node_get_service(data->node, QMI_SERVICE_WDS);
++	bind_wds(data, data->bind_wds);
+ }
+ 
+ /* Second modem for SIM 2, created once the first one is powered */
+@@ -438,6 +460,24 @@
+ 			ofono_modem_get_integer(modem,
+ 					"NetworkInterfaceIndex"));
+ 	ofono_modem_set_integer(sub1, "Subscription", 1);
++
++	/* M52XQ: the data path of SIM 2 uses the same premux links */
++	{
++		int n = ofono_modem_get_integer(modem, "NumPremuxInterfaces");
++		char key[64];
++		int k;
++
++		ofono_modem_set_integer(sub1, "NumPremuxInterfaces", n);
++
++		for (k = 1; k <= n; k++) {
++			snprintf(key, sizeof(key), "PremuxInterface%dMuxId", k);
++			ofono_modem_set_integer(sub1, key,
++					ofono_modem_get_integer(modem, key));
++			snprintf(key, sizeof(key), "PremuxInterface%d", k);
++			ofono_modem_set_string(sub1, key,
++					ofono_modem_get_string(modem, key));
++		}
++	}
+ 	ofono_modem_set_powered_timeout_hint(sub1, 30);
+ 
+ 	if (ofono_modem_register(sub1) < 0) {
+@@ -876,6 +916,9 @@
+ 								QMI_SERVICE_WDS);
+ 	struct ofono_gprs_context *gc;
+ 
++	bind_wds(data, ipv4);
++	bind_wds(data, ipv6);
++
+ 	gc = ofono_gprs_context_create(modem, 0, "qmimodem", mux_id, ipv4, ipv6);
+ 	if (!gc) {
+ 		ofono_warn("Unable to create gprs-context for: %s, %s[%u]",
+@@ -898,7 +941,8 @@
+ 	char buf[256];
+ 	int i;
+ 
+-	gprs = ofono_gprs_create(modem, 0, "qmimodem",
++	/* vendor = subscription: see drivers/qmimodem/gprs.c */
++	gprs = ofono_gprs_create(modem, data->subscription, "qmimodem",
+ 			qmi_qrtr_node_get_service(node, QMI_SERVICE_WDS),
+ 			qmi_qrtr_node_get_service(node, QMI_SERVICE_NAS));
+ 	if (!gprs) {
+@@ -956,9 +1000,11 @@
+ 			ofono_message_waiting_register(mw);
+ 	}
+ 
+-	/* Mobile data (IPA, rmnet) stays with SIM 1 */
+-	if (data->subscription == 0)
+-		setup_gprs(modem);
++	/*
++	 * Mobile data (IPA, rmnet): both subscriptions have the atoms, the
++	 * data subscription of the modem (DDS) decides which one connects.
++	 */
++	setup_gprs(modem);
+ }
+ 
+ static void qrtrqmi_post_online(struct ofono_modem *modem)
+--- a/drivers/qmimodem/gprs.c
++++ b/drivers/qmimodem/gprs.c
+@@ -26,6 +26,7 @@
+ 	struct qmi_service *nas;
+ 	struct qmi_service *wds;
+ 	unsigned int default_profile;
++	unsigned int subscription;
+ 	bool lte_queried;
+ 	guint lte_retry_source;
+ 	int lte_retries;
+@@ -154,6 +155,16 @@
+ 		return -1;
+ 
+ 	/*
++	 * M52XQ: the NAS serving system ignores the subscription binding: for
++	 * SIM 2 it shows SIM 1 (and a detached PS when the data are on
++	 * SIM 2). The data call itself decides, as in ModemManager.
++	 */
++	if (data->subscription) {
++		status = NETWORK_REGISTRATION_STATUS_REGISTERED;
++		return status;
++	}
++
++	/*
+ 	 * M52XQ: the Data System Status event report arrives only on a change.
+ 	 * When ofonod starts with LTE already up it never arrives and the
+ 	 * default bearer is never noticed (Attached stays false): ask for the
+@@ -264,12 +275,20 @@
+ 					ofono_gprs_cb_t cb, void *user_data)
+ {
+ 	struct gprs_data *data = ofono_gprs_get_data(gprs);
+-	struct cb_data *cbd = cb_data_new(cb, user_data);
++	struct cb_data *cbd;
+ 	struct qmi_param *param;
+ 	uint8_t action;
+ 
+ 	DBG("attached %d", attached);
+ 
++	/* M52XQ: an explicit attach is refused ('Internal') on SIM 2 */
++	if (data->subscription) {
++		CALLBACK_WITH_SUCCESS(cb, user_data);
++		return;
++	}
++
++	cbd = cb_data_new(cb, user_data);
++
+ 	if (attached)
+ 		action = QMI_NAS_ATTACH_ACTION_ATTACH;
+ 	else
+@@ -499,6 +518,7 @@
+ 	}
+ 
+ 	data = l_new(struct gprs_data, 1);
++	data->subscription = vendor;
+ 	data->wds = wds;
+ 	data->nas = nas;
+ 

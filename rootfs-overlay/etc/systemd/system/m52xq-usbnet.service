@@ -1,0 +1,31 @@
+[Unit]
+Description=M52XQ USB gadget + static net (SSH)
+After=multi-user.target systemd-udevd.service
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'set -x; CFS=/sys/kernel/config/usb_gadget; \
+  modprobe libcomposite 2>/dev/null; \
+  for i in $(seq 1 40); do udc=$(ls /sys/class/udc 2>/dev/null | head -1); [ -n "$udc" ] && break; sleep 1; done; \
+  [ -z "$udc" ] && { echo NO-UDC; exit 1; }; \
+  if [ ! -e $CFS/g1 ]; then \
+    mkdir -p $CFS/g1/strings/0x409 $CFS/g1/configs/c.1/strings/0x409; \
+    echo 0x18d1 > $CFS/g1/idVendor; echo 0xd001 > $CFS/g1/idProduct; \
+    echo m52xq > $CFS/g1/strings/0x409/serialnumber; echo pmOS > $CFS/g1/strings/0x409/manufacturer; echo M52XQ > $CFS/g1/strings/0x409/product; \
+    echo net > $CFS/g1/configs/c.1/strings/0x409/configuration; \
+    fn=rndis.usb0; mkdir $CFS/g1/functions/$fn 2>/dev/null || { fn=ncm.usb0; mkdir $CFS/g1/functions/$fn; }; \
+    ln -s $CFS/g1/functions/$fn $CFS/g1/configs/c.1/$fn ; \
+  fi; \
+  if [ -z "$(cat $CFS/g1/UDC 2>/dev/null | tr -d " \n")" ]; then \
+    for i in $(seq 1 20); do \
+      if echo "$udc" > $CFS/g1/UDC 2>/dev/null; then echo UDC-OK; break; fi; \
+      echo "UDC-retry$i: $(dmesg | grep -iE \"dwc3|genirq|irq #28|udc \" | tail -2)"; sleep 2; \
+    done; \
+  else echo "UDC already bound"; fi; \
+  for i in $(seq 1 15); do [ -e /sys/class/net/usb0 ] && break; sleep 1; done; \
+  ip addr add 172.16.42.1/24 dev usb0 2>/dev/null; ip link set usb0 up; ip addr show usb0'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,275 @@
+diff --git a/plugins/gobi.c b/plugins/gobi.c
+index 54b64acb..bfc9c1e8 100644
+--- a/plugins/gobi.c
++++ b/plugins/gobi.c
+@@ -38,6 +38,7 @@
+ #include <ofono/location-reporting.h>
+ #include <ofono/log.h>
+ #include <ofono/message-waiting.h>
++#include <ofono/slot.h>
+ 
+ #include <ell/ell.h>
+ 
+@@ -54,6 +55,28 @@
+ #define GOBI_UIM	(1 << 5)
+ #define GOBI_VOICE	(1 << 6)
+ #define GOBI_WDA	(1 << 7)
++#define IMEI_LEN	16
++
++static char imei[IMEI_LEN] = "1234567890123456";
++
++typedef struct ofono_slot_driver_data {
++	struct ofono_slot_manager *slot_manager;
++	struct l_queue *slots;
++} GobiPlugin;
++
++typedef struct ofono_slot_data {
++	struct ofono_slot *handle;
++	struct ofono_modem *modem;
++	GobiPlugin *plugin;
++	char imei[IMEI_LEN];
++} GobiSlot;
++
++static struct ofono_modem *global_modem = NULL;
++static GobiPlugin *global_plugin = NULL;
++static struct ofono_slot_driver_reg *gobi_ofono_slot_driver = NULL;
++static bool gobi_slot_plugin_start(void *user_data);
++static void gobi_slot_driver_startup_check();
++static void gobi_slot_set_sim_state(struct ofono_sim *sim);
+ 
+ #define MAX_CONTEXTS 4
+ 
+@@ -76,6 +99,7 @@ struct gobi_data {
+ 		struct qmi_service *wds_ipv4;
+ 		struct qmi_service *wds_ipv6;
+ 	} context_services[MAX_CONTEXTS];
++	struct ofono_sim   *sim;
+ 	struct service_request service_requests[8 + MAX_CONTEXTS * 2];
+ 	int cur_service_request;
+ 	int num_service_requests;
+@@ -105,6 +129,28 @@ static void gobi_io_debug(const char *str, void *user_data)
+ 	ofono_debug("%s%s", prefix, str);
+ }
+ 
++/*IMEI CALLBACK*/
++static void gobi_get_ids_cb(struct qmi_result *result, void *user_data)
++{
++	char *str;
++	struct cb_data *cbd = user_data;
++	ofono_devinfo_query_cb_t cb = cbd->cb;
++
++	str = qmi_result_get_string(result, QMI_DMS_RESULT_ESN);
++	if (!str || strcmp(str, "0") == 0) {
++		str = qmi_result_get_string(result, QMI_DMS_RESULT_IMEI);
++		if (!str) {
++			CALLBACK_WITH_FAILURE(cb, NULL, cbd->data);
++			return;
++		} else {
++			ofono_info("Got IMEI %s", str);
++			l_strlcpy(imei, str, sizeof(imei));
++			gobi_slot_driver_startup_check();
++		}
++	}
++   l_free(str);
++}
++
+ /*
+  * Probe the modem.  The following modem properties are expected to be set
+  * in order to initialize the driver properly:
+@@ -169,6 +215,11 @@ static int gobi_probe(struct ofono_modem *modem)
+ 	ofono_modem_set_data(modem, data);
+ 	ofono_modem_set_capabilities(modem, OFONO_MODEM_CAPABILITY_LTE);
+ 
++	if (!global_modem) {
++		global_modem = modem;
++	}
++
++    gobi_slot_plugin_start(gobi_ofono_slot_driver);
+ 	return 0;
+ }
+ 
+@@ -223,6 +274,8 @@ static void gobi_remove(struct ofono_modem *modem)
+ 
+ 	cleanup_services(data);
+ 
++	ofono_slot_driver_unregister(gobi_ofono_slot_driver);
++
+ 	qmi_qmux_device_free(data->device);
+ 
+ 	l_free(data);
+@@ -431,6 +484,11 @@ static void get_data_format_cb(struct qmi_result *result, void *user_data)
+ 	setup_qmi_wwan(data->main_net_name, llproto);
+ 
+ done:
++
++	/*Get modem IMEI*/
++	qmi_service_send(data->dms, QMI_DMS_GET_IDS, NULL,
++					 gobi_get_ids_cb, modem, NULL);
++
+ 	if (qmi_service_send(data->dms, QMI_DMS_GET_CAPS, NULL,
+ 						get_caps_cb, modem, NULL) > 0)
+ 		return;
+@@ -788,11 +846,11 @@ static void gobi_pre_sim(struct ofono_modem *modem)
+ 	ofono_devinfo_create(modem, 0, "qmimodem", qmi_service_clone(data->dms));
+ 
+ 	if ((data->features & GOBI_UIM) && !legacy)
+-		ofono_sim_create(modem, 0, "qmimodem",
++		data->sim = ofono_sim_create(modem, 0, "qmimodem",
+ 						qmi_service_clone(data->dms),
+ 						qmi_service_clone(data->uim));
+ 	else /* DMS always available */
+-		ofono_sim_create(modem, 0, "qmimodem_legacy",
++		data->sim = ofono_sim_create(modem, 0, "qmimodem_legacy",
+ 						qmi_service_clone(data->dms));
+ 
+ 	if (data->features & GOBI_VOICE)
+@@ -802,6 +860,8 @@ static void gobi_pre_sim(struct ofono_modem *modem)
+ 	if (data->features & GOBI_PDS) /* exclusive use, no need to clone */
+ 		ofono_location_reporting_create(modem, 0, "qmimodem",
+ 						l_steal_ptr(data->pds));
++
++	gobi_slot_set_sim_state(data->sim);
+ }
+ 
+ static void gobi_setup_gprs(struct ofono_modem *modem)
+@@ -898,6 +958,8 @@ static void gobi_post_sim(struct ofono_modem *modem)
+ 
+ 	if (data->features & GOBI_WDS)
+ 		gobi_setup_gprs(modem);
++
++	gobi_slot_set_sim_state(data->sim);
+ }
+ 
+ static void gobi_post_online(struct ofono_modem *modem)
+@@ -925,6 +987,131 @@ static void gobi_post_online(struct ofono_modem *modem)
+ 	}
+ }
+ 
++// ========== Slot Driver ==========
++
++static GobiPlugin *gobi_slot_driver_init(struct ofono_slot_manager *m)
++{
++	DBG("gobi_slot_driver_init");
++
++	GobiPlugin *plugin = l_new(GobiPlugin, 1);
++	plugin->slot_manager = m;
++
++	GobiSlot *slot = l_new(GobiSlot, 1);
++	plugin->slots = l_queue_new();
++	l_queue_push_tail(plugin->slots, slot);
++
++	global_plugin = plugin;
++	return plugin;
++}
++
++static void gobi_slot_set_sim_state(struct ofono_sim *sim)
++{
++	DBG("gobi_slot_set_sim_state");
++
++	if (!sim) {
++		DBG("No SIM");
++		return;
++	}
++
++	GobiSlot *slot = NULL;
++	slot = (GobiSlot *)l_queue_peek_head(global_plugin->slots);
++
++	if (!slot) {
++		DBG("No slot yet");
++		return;
++	}
++
++	enum ofono_sim_state state = ofono_sim_get_state(sim);
++	enum ofono_slot_sim_presence p = OFONO_SLOT_SIM_UNKNOWN;
++
++	switch (state) {
++	case OFONO_SIM_STATE_INSERTED:
++	case OFONO_SIM_STATE_READY:
++		p = OFONO_SLOT_SIM_PRESENT;
++		break;
++	case OFONO_SIM_STATE_NOT_PRESENT:
++		p = OFONO_SLOT_SIM_ABSENT;
++		break;
++	case OFONO_SIM_STATE_LOCKED_OUT:
++	case OFONO_SIM_STATE_RESETTING:
++		p = OFONO_SLOT_SIM_UNKNOWN;
++		break;
++	}
++	ofono_slot_set_sim_presence(slot->handle, p);
++}
++
++static void gobi_slot_driver_startup_check()
++{
++	static bool _started = false;
++	DBG("gobi_slot_driver_startup_check");
++
++	if (_started) {
++		return;
++	}
++
++	if (!global_plugin) {
++		DBG("No global plugin yet");
++		return;
++	}
++
++	GobiSlot *slot = NULL;
++	slot = (GobiSlot *)l_queue_peek_head(global_plugin->slots);
++
++	if (!slot) {
++		DBG("No slot yet");
++		return;
++	}
++
++	if (!slot->modem) {
++		slot->modem = global_modem;
++	}
++	l_strlcpy(slot->imei, imei, sizeof(slot->imei) );
++
++	slot->handle = ofono_slot_add(global_plugin->slot_manager,
++				ofono_modem_get_path(slot->modem), (OFONO_RADIO_ACCESS_MODE_GSM | OFONO_RADIO_ACCESS_MODE_UMTS | OFONO_RADIO_ACCESS_MODE_LTE),
++				slot->imei, "00",
++				OFONO_SLOT_SIM_UNKNOWN,
++				OFONO_SLOT_NO_FLAGS);
++
++	ofono_slot_driver_started(gobi_ofono_slot_driver);
++	_started = true;
++}
++
++static uint gobi_slot_driver_start(GobiPlugin *plugin)
++{
++	DBG("gobi_slot_driver_start");
++	return 1;
++}
++
++static void gobi_slot_driver_cancel(GobiPlugin *plugin, uint id)
++{
++	DBG("gobi_slot_driver_cancel");
++}
++
++static void gobi_slot_driver_cleanup(GobiPlugin *plugin)
++{
++	DBG("gobi_slot_driver_cleanup");
++	l_queue_destroy(plugin->slots, l_free);
++	l_free(plugin);
++}
++
++static bool gobi_slot_plugin_start(void *user_data)
++{
++	ofono_info("gobi_slot_plugin_start");
++	static const struct ofono_slot_driver gobi_slot_driver = {
++		.name = "gobi_slot",
++		.api_version = OFONO_SLOT_API_VERSION,
++		.init = gobi_slot_driver_init,
++		.start = gobi_slot_driver_start,
++		.cancel = gobi_slot_driver_cancel,
++		.cleanup = gobi_slot_driver_cleanup,
++	};
++
++	/* Register the driver */
++	gobi_ofono_slot_driver = ofono_slot_driver_register(&gobi_slot_driver);
++	return true;
++}
++
+ static struct ofono_modem_driver gobi_driver = {
+ 	.probe		= gobi_probe,
+ 	.remove		= gobi_remove,

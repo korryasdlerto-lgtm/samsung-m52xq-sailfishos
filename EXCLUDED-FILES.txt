@@ -1,0 +1,78 @@
+# Files of the image that are not in this repository: binaries built from build/, firmware and kernel modules, symlinks,
+# and two proprietary files of Jolla. Format: path, size and md5 of the release image (or the link target).
+etc/m52xq-sensorspd-enable  0  d41d8cd98f00b204e9800998ecf8427e
+etc/systemd/system/multi-user.target.wants/m52xq-audio-reprobe.service  link -> ../m52xq-audio-reprobe.service
+etc/systemd/system/multi-user.target.wants/m52xq-bt-awake.service  link -> ../m52xq-bt-awake.service
+etc/systemd/system/multi-user.target.wants/m52xq-dds-sync.service  link -> ../m52xq-dds-sync.service
+etc/systemd/system/multi-user.target.wants/m52xq-home-on-userdata.service  link -> ../m52xq-home-on-userdata.service
+etc/systemd/system/multi-user.target.wants/m52xq-wow.service  link -> ../m52xq-wow.service
+etc/systemd/system/network.target.wants/ofono.service  link -> /dev/null
+lib/modules/7.1.13/extra/venus/venus-core.ko  3492608  d6f9178dfbed52358a2716e2924040d0
+lib/modules/7.1.13/extra/venus/venus-dec.ko  764560  0f21688c4819e1ff637e07355054193c
+lib/modules/7.1.13/extra/venus/venus-enc.ko  772008  9116aedb506b165c2d9b35af4fc21cc7
+lib/modules/7.1.13/kernel/drivers/media/platform/qcom/venus/venus-core.ko  3492608  d6f9178dfbed52358a2716e2924040d0
+lib/modules/7.1.13/kernel/drivers/media/platform/qcom/venus/venus-dec.ko  764560  0f21688c4819e1ff637e07355054193c
+lib/modules/7.1.13/kernel/drivers/media/platform/qcom/venus/venus-enc.ko  772008  9116aedb506b165c2d9b35af4fc21cc7
+usr/bin/qrtr-lookup  67904  3ffd426c8e116ccd67ca3773360e554d
+usr/bin/qrtr-ns  67904  1a0384e99e690495182d944427129867
+usr/bin/rmtfs  69432  9dbd1816b95d5f77c377169705d74f03
+usr/bin/tqftpserv  67744  81d59f91c57962ac972ad74922b0a111
+usr/lib/systemd/user/dbus-org.freedesktop.Geoclue.Providers.Hybris.service  link -> geoclue-providers-hybris.service
+usr/lib/systemd/user/user-session.target.wants/m52xq-callaudio-sfos.service  link -> ../m52xq-callaudio-sfos.service
+usr/lib64/gstreamer-1.0/libgstlibcamera.so  201968  b1b0a467031380907c6ee243d8f9c2fe
+usr/lib64/libQt5Multimedia.so.5.6.2  1125488  11365acb6d44c3f8f1af0a12b1e029ce
+usr/lib64/libQt5MultimediaQuick_p.so.5.6.2  135528  5fa3da4187060a5afca003fe02add63f
+usr/lib64/libcamera-base.so  link -> libcamera-base.so.0.8
+usr/lib64/libcamera-base.so.0.8  link -> libcamera-base.so.0.8.0
+usr/lib64/libcamera-base.so.0.8.0  252040  a155c8d095f930a6ff55f5a51029f5eb
+usr/lib64/libcamera.so  link -> libcamera.so.0.8
+usr/lib64/libcamera.so.0.8  link -> libcamera.so.0.8.0
+usr/lib64/libcamera.so.0.8.0  2294184  c2512ed32319cc1a105584d6d0b267f5
+usr/lib64/libcamera/ipa/ipa_softisp.so  534320  d2b77bf4e966aadc8d2d6458abf09386
+usr/lib64/libcamera/ipa/ipa_softisp.so.sign  256  756f55b682e49464d305ee11262f781d
+usr/lib64/libell.so.0  link -> libell.so.0.0.2
+usr/lib64/libell.so.0.0.2  625672  2fc577450ede05bbfab59adbc7d4afa6
+usr/lib64/libhexagonrpc.so.0.4  67552  f9f1be657958ec039d4265ac8f22a551
+usr/lib64/libprotobuf-c.so.1  link -> libprotobuf-c.so.1.0.0
+usr/lib64/libprotobuf-c.so.1.0.0  192088  85bb19c568d9d85dc50a032113844a68
+usr/lib64/libqgsttools_p.so.1.0.0  268608  94cc39578a2233f23569774bcbd3b40d
+usr/lib64/libqrtr.so.1  link -> libqrtr.so.1.2
+usr/lib64/libqrtr.so.1.2  67576  d34d040487adb77ed7b59d01e600f1ad
+usr/lib64/libssc.so.2  171336  13804b794b16b6ea91325af1d08531ac
+usr/lib64/m52xq/libssc.so.2  171376  0d1dbf263b70f08806f99e47228360e2
+usr/lib64/m52xq/m52xq-rawphoto  69144  e71156b7bb11549bad4bee087a7f3b7f
+usr/lib64/qt5/plugins/mediaservice/libgstcamerabin.so  400304  128fe0a3b8cac71b7507f4436261a8cc
+usr/lib64/qt5/plugins/mediaservice/libgstmediaplayer.so  135224  e98196b8b450eb58d0f0874d430d8489
+usr/lib64/qt5/qml/QtMultimedia/libdeclarative_multimedia.so  333544  582d0bf64cbc38ba22f4e1d64b4744ce
+usr/lib64/sensord-qt5/libsscaccelerometeradaptor-qt5.so  68992  448094b8fedfd52719245bb75e04356c
+usr/lib64/sensord-qt5/libsscalsadaptor-qt5.so  68976  8ef0e6f8f1aec05ab40dff1ca04da14d
+usr/lib64/sensord-qt5/libsscgyroscopeadaptor-qt5.so  68976  a8eceaeaef3fce7f179294411f398fb5
+usr/lib64/sensord-qt5/libsscmagnetometeradaptor-qt5.so  68976  b880569f9eed60b50433c479353bf67e
+usr/lib64/sensord-qt5/libsscproximityadaptor-qt5.so  68976  b6b1bd7015bc21b376490b509043d380
+usr/libexec/geoclue-hybris  201232  d06ac93091e5c662370109d795638897
+usr/libexec/hexagonrpc/chrecd  67872  fffb7950303cf4886b927981b4637afa
+usr/libexec/hexagonrpc/hexagonrpcd  68464  3cfa59babb8a646615ee2be3c9d9a641
+usr/libexec/libcamera/softisp_ipa_proxy  165144  a390017e75ff6b2d2f428245327deadf
+usr/libexec/m52xq/m52xq-bt-awake  68072  69b1ef7222b4f899db9ba12ed1e0b97b
+usr/libexec/m52xq/m52xq-flashlight  67992  b79b0c996f0b35383cd4bfb8892ff67a
+usr/local/bin/ssccli  92376  81fee3687e11d7bc82c2abc669b69f35
+usr/sbin/ofonod  7692024  583871b1295ff147039c68887895a402
+usr/share/jolla-settings/entries/flashlight.json  482  56f0a6431faaf61c668ea8b4aaeccb48  (from the Jolla package jolla-settings-system-flashlight)
+usr/share/jolla-settings/pages/flashlight/EnableSwitch.qml  422  fcc58f16eee760ecf8cb4d039b4748be  (from the Jolla package jolla-settings-system-flashlight)
+usr/share/ofono/provision.db  167918  72f29340c4e9735664b7a7e2e1290f97
+usr/share/qt5/keymaps/droid.qmap  340  40286de5c975a5f6604dd1b8634c812a
+var/lib/nemo-pulseaudio-parameters/modes/bta2dp/mainvolume  link -> ../../algs/mainvolume/bta2dp
+var/lib/nemo-pulseaudio-parameters/modes/btmono-hfp/mainvolume  link -> ../../algs/mainvolume/btmono
+var/lib/nemo-pulseaudio-parameters/modes/btmono-hsp/mainvolume  link -> ../../algs/mainvolume/btmono
+var/lib/nemo-pulseaudio-parameters/modes/btmono/mainvolume  link -> ../../algs/mainvolume/btmono
+var/lib/nemo-pulseaudio-parameters/modes/hp/mainvolume  link -> ../../algs/mainvolume/hp
+var/lib/nemo-pulseaudio-parameters/modes/hs/mainvolume  link -> ../../algs/mainvolume/lineout
+var/lib/nemo-pulseaudio-parameters/modes/ihf/mainvolume  link -> ../../algs/mainvolume/ihf
+var/lib/nemo-pulseaudio-parameters/modes/ihfandbtmono-hfp/mainvolume  link -> ../../algs/mainvolume/btmono
+var/lib/nemo-pulseaudio-parameters/modes/ihfandbtmono-hsp/mainvolume  link -> ../../algs/mainvolume/btmono
+var/lib/nemo-pulseaudio-parameters/modes/ihfandbtmono/mainvolume  link -> ../../algs/mainvolume/btmono
+var/lib/nemo-pulseaudio-parameters/modes/ihfandheadset/mainvolume  link -> ../../algs/mainvolume/ihf
+var/lib/nemo-pulseaudio-parameters/modes/ihfandlineout/mainvolume  link -> ../../algs/mainvolume/ihf
+var/lib/nemo-pulseaudio-parameters/modes/lineout/mainvolume  link -> ../../algs/mainvolume/lineout
+var/lib/nemo-pulseaudio-parameters/modes/usbaudio/mainvolume  link -> ../../algs/mainvolume/lineout
+usr/share/qcom/sm7325/Samsung/m52xq/sensors/  (sensor registry = factory calibration of one phone, from persist; configs + sns_reg.conf from the vendor partition: copied by the installer from the phone being flashed)

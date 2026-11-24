@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+# M52XQ (Sailfish): the modem data subscription (DDS) follows the Sailfish default data SIM (ofono slot manager: Settings ->
+# Mobile network -> "Use SIM card", or the SIM cards manager). Without it the data call of the other SIM is refused.
+import subprocess
+import sys
+import time
+from gi.repository import Gio, GLib
+
+BUS = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+IFACE = 'org.nemomobile.ofono.ModemManager'
+last = None
+
+
+def log(m):
+    print('m52xq-dds-sync: ' + m, flush=True)
+
+
+def default_modem():
+    try:
+        r = BUS.call_sync('org.ofono', '/', IFACE, 'GetDefaultDataModem', None, None, Gio.DBusCallFlags.NONE, 5000, None)
+        return r.unpack()[0]
+    except GLib.Error as e:
+        log('no default data modem: ' + e.message.split(':')[-1].strip())
+        return ''
+
+
+def apply(path):
+    global last
+    n = {'0': '1', '1': '2'}.get(path.rsplit('_', 1)[-1]) if path else None
+    if not n or n == last:
+        return False
+    r = subprocess.run(['/usr/local/bin/m52xq-dds', 'set', n], capture_output=True, text=True)
+    if r.returncode == 0:
+        last = n
+        log('DDS -> SIM ' + n)
+    else:
+        log('DDS -> SIM %s failed: %s' % (n, (r.stderr or r.stdout).strip()[-80:]))
+        GLib.timeout_add_seconds(30, lambda: apply(default_modem()) and False)
+    return False
+
+
+def on_signal(conn, sender, path, iface, signal, params):
+    if signal in ('DefaultDataModemChanged', 'DefaultDataSimChanged'):
+        GLib.timeout_add_seconds(1, lambda: apply(default_modem()) and False)
+
+
+BUS.signal_subscribe('org.ofono', IFACE, None, '/', None, Gio.DBusSignalFlags.NONE, on_signal)
+
+
+def appeared(conn, name, owner):
+    GLib.timeout_add_seconds(10, lambda: apply(default_modem()) and False)
+
+
+Gio.bus_watch_name_on_connection(BUS, 'org.ofono', Gio.BusNameWatcherFlags.NONE, appeared, None)
+log('watching the default data SIM')
+GLib.MainLoop().run()

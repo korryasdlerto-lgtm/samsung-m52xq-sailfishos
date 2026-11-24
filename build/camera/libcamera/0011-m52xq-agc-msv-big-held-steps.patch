@@ -1,0 +1,111 @@
+From: Asdlerto Korry <korryasdlerto@gmail.com>
+Subject: [PATCH] m52xq: ipa: AgcMSV: big held steps far from the target
+
+Sensors without a CameraSensorHelper (s5kgw3, imx616, gc5035) use AgcMSV,
+which moves exposure/gain by at most ~10 % per frame and recomputes every
+frame from delayed sensor values: a camera opened in a dark room stayed dark
+for seconds. Far from the target (|error| > 0.6) apply one step of 2^error
+(0.25 .. 2.5) on exposure * gain and hold it for 2 frames while the sensor
+applies it; near the target the proportional step is unchanged.
+---
+--- a/src/ipa/libipa/agc_msv.cpp
++++ b/src/ipa/libipa/agc_msv.cpp
+@@ -125,6 +125,21 @@
+  * scene changes dramatically.
+  */
+ static constexpr float kExpMaxStep = 0.15;
++
++/*
++ * m52xq: far from the target (|error| above kExpBoostError) one big step of
++ * 2^error (clamped to [kExpBoostMin, kExpBoostMax]) on the exposure * gain
++ * product, then kExpBoostHold frames without a new step: the statistics of
++ * those frames still come from the old exposure (sensor control delays), a new
++ * step from them would overshoot. With the 10 % proportional step alone a
++ * camera opened in a dark room (exposure at the default, gain at the minimum)
++ * needed several seconds to get out of the dark (main s5kgw3, front imx616,
++ * macro gc5035 have no sensor helper and use this algorithm).
++ */
++static constexpr float kExpBoostError = 0.6;
++static constexpr float kExpBoostMin = 0.25;
++static constexpr float kExpBoostMax = 2.5;
++static constexpr unsigned int kExpBoostHold = 2;
+ 
+ std::optional<float> calculateMSV(const Histogram &histogram)
+ {
+@@ -174,6 +189,29 @@
+ 	AgcMSV::Result result = { params.exposure, params.gain };
+ 
+ 	if (auto exposureMSV = calculateMSV(params.yHist)) {
++		float error = kExposureOptimal - *exposureMSV;
++
++		if (std::abs(error) > kExpBoostError) {
++			if (boostHold_ > 0) {
++				boostHold_--;
++				return boostResult_;
++			}
++
++			result = boostExposure(params.exposure, params.gain, error);
++			result.exposure = std::clamp(result.exposure, limits_.exposure[0], limits_.exposure[1]);
++			result.analogueGain = std::clamp(result.analogueGain, limits_.gain[0], limits_.gain[1]);
++			boostResult_ = result;
++			boostHold_ = kExpBoostHold;
++
++			LOG(AgcMSV, Debug)
++				<< "boost error:" << error
++				<< " exposure:" << result.exposure
++				<< " analogue-gain:" << result.analogueGain;
++
++			return result;
++		}
++
++		boostHold_ = 0;
+ 		result = updateExposure(params.exposure, params.gain, *exposureMSV);
+ 	} else {
+ 		LOG(AgcMSV, Debug)
+@@ -188,6 +226,31 @@
+ 		<< " analogue-gain:" << result.analogueGain;
+ 
+ 	return result;
++}
++
++AgcMSV::Result AgcMSV::boostExposure(uint32_t exposure, double again, float error)
++{
++	float factor = std::clamp(std::pow(2.0f, error), kExpBoostMin, kExpBoostMax);
++
++	if (factor > 1.0f) {
++		/* Too dark: exposure first, the rest of the factor on the gain. */
++		uint32_t next = std::min<uint32_t>(std::max<uint32_t>(exposure * factor, exposure + 1),
++						   std::max(limits_.exposure[1], exposure));
++		double rest = exposure ? factor * exposure / next : factor;
++		if (rest > 1.0)
++			again = again * rest;
++		exposure = next;
++	} else {
++		/* Too bright: gain first (down to gain1), the rest on the exposure. */
++		double low = std::max(limits_.gain1, limits_.gain[0]);
++		double next = std::max(again * factor, std::min(low, again));
++		double rest = again > 0 ? factor * again / next : factor;
++		again = next;
++		if (rest < 1.0)
++			exposure = std::max<uint32_t>(exposure * rest, 1);
++	}
++
++	return { exposure, again };
+ }
+ 
+ AgcMSV::Result AgcMSV::updateExposure(uint32_t exposure, double again, float exposureMSV)
+--- a/src/ipa/libipa/agc_msv.h
++++ b/src/ipa/libipa/agc_msv.h
+@@ -42,8 +42,12 @@
+ 
+ private:
+ 	AgcMSV::Result updateExposure(uint32_t exposure, double again, float exposureMSV);
++	AgcMSV::Result boostExposure(uint32_t exposure, double again, float error);
+ 
+ 	Limits limits_ = {};
++	/* m52xq: big steps far from the target, held while the sensor applies them */
++	unsigned int boostHold_ = 0;
++	Result boostResult_ = {};
+ };
+ 
+ } /* namespace ipa */

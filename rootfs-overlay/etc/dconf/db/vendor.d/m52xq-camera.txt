@@ -1,0 +1,36 @@
+# m52xq: primary = s5kgw3 (64 MP, binned 4:3), secondary = imx616 (front)
+[apps/jolla-camera]
+maxVideoResolution='1920x1080'
+# labels of the back cameras in the order of captureview-camera-order.py: imx258 (ultra wide), s5kgw3 (main), gc5035 (macro)
+backCameraLabels=['0.5', '1.0', 'M']
+
+[apps/jolla-camera/primary/image]
+imageResolution='4000x3000'
+viewfinderResolution='1280x960'
+viewfinderResolution_4_3='1280x960'
+viewfinderResolution_16_9='1280x720'
+
+[apps/jolla-camera/primary/video]
+videoResolution='1920x1080'
+viewfinderResolution='1280x720'
+viewfinderResolution_4_3='1280x960'
+viewfinderResolution_16_9='1280x720'
+
+[apps/jolla-camera/secondary/image]
+imageResolution='3200x2400'
+viewfinderResolution='1280x960'
+viewfinderResolution_4_3='1280x960'
+viewfinderResolution_16_9='1280x720'
+
+[apps/jolla-camera/secondary/video]
+videoResolution='1920x1080'
+viewfinderResolution='1280x720'
+viewfinderResolution_4_3='1280x960'
+viewfinderResolution_16_9='1280x720'
+
+# 16:9 pictures (the viewfinder fills more of the 20:9 screen)
+[apps/jolla-camera/back/image]
+aspectRatio=1
+
+[apps/jolla-camera/front/image]
+aspectRatio=1

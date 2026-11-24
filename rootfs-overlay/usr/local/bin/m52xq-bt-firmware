@@ -1,0 +1,42 @@
+#!/bin/sh
+# m52xq (Sailfish): reload the Bluetooth firmware once /lib/firmware on the rootfs is available, then set this phone's BD address.
+# Same logic as the Debian/pmOS m52xq-bt-firmware: hci_uart_qca (built in) runs its setup at ~2 s, before the rootfs and the WPSS,
+# so the first setup fails; an unbind while it retries blocks suspend. So: do nothing while Bluetooth is rfkill-blocked, rebind
+# once when it is switched on. Sailfish has no python3: the address (/etc/m52xq/bt_addr, from Samsung EFS, copied by the installer)
+# is set with "btmgmt public-addr" (bluez5-tools) instead of m52xq-bt-addr.py.
+d=/sys/bus/serial/drivers/hci_uart_qca
+ADDR_FILE=/etc/m52xq/bt_addr
+set_addr() {
+	[ -r $ADDR_FILE ] || { echo "no $ADDR_FILE, address not set"; return; }
+	addr=$(tr -d ' \n' < $ADDR_FILE)
+	echo "$addr" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$' || { echo "bad address in $ADDR_FILE"; return; }
+	for i in $(seq 30); do
+		idx=$(ls /sys/class/bluetooth 2>/dev/null | sed -n 's/^hci\([0-9]*\)$/\1/p' | head -n1)
+		[ -n "$idx" ] && break
+		sleep 1
+	done
+	[ -n "$idx" ] || { echo "no hci device"; return; }
+	# right after the rebind the controller is still in setup: "Invalid Index" (0x11) -> retry. Usually 2-4 s, but a lost start race
+	# with the WPSS made the setup take 60 s (2026-11-24): wait up to $1 tries of 2 s
+	for i in $(seq ${1:-90}); do
+		btmgmt --index "$idx" public-addr "$addr" >/dev/null 2>&1 && { echo "hci$idx: public address set (try $i)"; return 0; }
+		sleep 2
+	done
+	echo "hci$idx: setting the public address failed"
+	return 1
+}
+rebind() {
+	[ -e $d/serial0-0 ] && echo serial0-0 > $d/unbind
+	sleep 1
+	echo serial0-0 > $d/bind
+	set_addr "$1"
+}
+blocked() { rfkill list bluetooth 2>/dev/null | grep -q 'Soft blocked: yes'; }
+if blocked; then
+	rfkill event | while read -r line; do
+		blocked || break
+	done
+fi
+# first try 60 s, then one more rebind with up to 3 minutes
+rebind 30 || { echo "rebinding once more"; rebind 90; }
+exit 0

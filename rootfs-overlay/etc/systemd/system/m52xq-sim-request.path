@@ -1,0 +1,8 @@
+[Unit]
+Description=M52XQ: watch for SIM cards manager requests
+After=m52xq-sim-dir.service
+Requires=m52xq-sim-dir.service
+[Path]
+PathChanged=/run/m52xq-sim/request
+[Install]
+WantedBy=multi-user.target

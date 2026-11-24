@@ -1,0 +1,49 @@
+M52XQ: qrtrqmi: QMAPv5 for IPA with MAPv5 checksum offload
+
+The IPA 4.11 of the SM7325 offloads MAPv5 checksums (device/feature/*_offload). Plain QMAP passes uplink packets but no
+downlink ever arrives. The rmnet links need the MAPv5 checksum flags (m52xq-modem-prep).
+
+--- a/plugins/qrtrqmi.c
++++ b/plugins/qrtrqmi.c
+@@ -528,6 +528,7 @@
+ #define QMI_WDA_LL_PROTOCOL_RAW_IP	0x02
+ #define QMI_WDA_AGGREGATION_QMAP	0x05
+ #define QMI_WDA_AGGREGATION_QMAPV4	0x08
++#define QMI_WDA_AGGREGATION_QMAPV5	0x09	/* M52XQ: IPA 4.9+ */
+ 
+ #define IPA_INTERFACE_NUMBER		1
+ #define IPA_DL_MAX_DATAGRAMS		32
+@@ -538,7 +539,7 @@
+  * plain QMAP passes uplink packets but no downlink ever arrives. The rmnet
+  * links need the matching MAPv4 checksum flags.
+  */
+-static bool ipa_offload_mapv4(const char *ifname)
++static bool ipa_offload_is(const char *ifname, const char *version)
+ {
+ 	char path[128];
+ 	char buf[8] = "";
+@@ -554,7 +555,7 @@
+ 		buf[0] = '\0';
+ 
+ 	fclose(f);
+-	return l_str_has_prefix(buf, "MAPv4");
++	return l_str_has_prefix(buf, version);
+ }
+ 
+ static bool read_ipa_endpoint(const char *ifname, const char *name,
+@@ -618,9 +619,14 @@
+ 	if (!data->wda)
+ 		goto done;
+ 
+-	if (ifname && ipa_offload_mapv4(ifname))
++	if (ifname && ipa_offload_is(ifname, "MAPv5"))
++		aggregation = QMI_WDA_AGGREGATION_QMAPV5;
++	else if (ifname && ipa_offload_is(ifname, "MAPv4"))
+ 		aggregation = QMI_WDA_AGGREGATION_QMAPV4;
+ 
++	ofono_info("%s: IPA data aggregation protocol %u",
++				ofono_modem_get_path(modem), aggregation);
++
+ 	param = qmi_param_new();
+ 	qmi_param_append_uint32(param, QMI_WDA_LL_PROTOCOL,
+ 					QMI_WDA_LL_PROTOCOL_RAW_IP);

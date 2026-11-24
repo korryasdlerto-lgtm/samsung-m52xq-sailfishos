@@ -1,0 +1,62 @@
+M52XQ: qrtrqmi: own premux links for SIM 2
+
+WDS clients of both subscriptions bound to the same mux ids make START NETWORK of SIM 2 fail with PolicyMismatch (79).
+SIM 1 uses the first three links, SIM 2 the next ones (m52xq-modem-prep creates six).
+
+--- a/plugins/qrtrqmi.c
++++ b/plugins/qrtrqmi.c
+@@ -72,6 +72,8 @@
+  * stays with the first modem.
+  */
+ #define QRTRQMI_MAX_SUBS		2
++/* M52XQ: premux links of one subscription; SIM 2 takes the next ones */
++#define QRTRQMI_SUB_LINKS		3
+ #define QMI_NAS_BIND_SUBSCRIPTION	0x0045
+ #define QMI_VOICE_BIND_SUBSCRIPTION	0x0044
+ #define QMI_WMS_BIND_SUBSCRIPTION	0x004c
+@@ -463,18 +465,26 @@
+ 
+ 	/* M52XQ: the data path of SIM 2 uses the same premux links */
+ 	{
+-		int n = ofono_modem_get_integer(modem, "NumPremuxInterfaces");
+-		char key[64];
++		int total = ofono_modem_get_integer(modem,
++						"NumPremuxInterfaces");
++		int first = total > QRTRQMI_SUB_LINKS ? QRTRQMI_SUB_LINKS : 0;
++		char key[64], key1[64];
+ 		int k;
+ 
+-		ofono_modem_set_integer(sub1, "NumPremuxInterfaces", n);
+-
+-		for (k = 1; k <= n; k++) {
+-			snprintf(key, sizeof(key), "PremuxInterface%dMuxId", k);
+-			ofono_modem_set_integer(sub1, key,
++		/* a client of the other subscription on the same mux id makes
++		 * the modem answer START NETWORK with PolicyMismatch */
++		ofono_modem_set_integer(sub1, "NumPremuxInterfaces",
++					total - first);
++
++		for (k = 1; k <= total - first; k++) {
++			snprintf(key, sizeof(key), "PremuxInterface%dMuxId",
++					k + first);
++			snprintf(key1, sizeof(key1), "PremuxInterface%dMuxId", k);
++			ofono_modem_set_integer(sub1, key1,
+ 					ofono_modem_get_integer(modem, key));
+-			snprintf(key, sizeof(key), "PremuxInterface%d", k);
+-			ofono_modem_set_string(sub1, key,
++			snprintf(key, sizeof(key), "PremuxInterface%d", k + first);
++			snprintf(key1, sizeof(key1), "PremuxInterface%d", k);
++			ofono_modem_set_string(sub1, key1,
+ 					ofono_modem_get_string(modem, key));
+ 		}
+ 	}
+@@ -941,6 +951,9 @@
+ 	char buf[256];
+ 	int i;
+ 
++	if (data->subscription == 0 && n_premux > QRTRQMI_SUB_LINKS)
++		n_premux = QRTRQMI_SUB_LINKS;
++
+ 	/* vendor = subscription: see drivers/qmimodem/gprs.c */
+ 	gprs = ofono_gprs_create(modem, data->subscription, "qmimodem",
+ 			qmi_qrtr_node_get_service(node, QMI_SERVICE_WDS),

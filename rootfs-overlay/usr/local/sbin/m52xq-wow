@@ -1,0 +1,23 @@
+#!/bin/sh
+# m52xq (Sailfish port of the Phosh m52xq-wow-params + 90-m52xq-wowlan): Wi-Fi stays up in the sleep and wakes the phone (WoW); s2idle instead of deep
+# (with "deep" every suspend failed as long as Bluetooth was up: 1118 of 1118 on 2026-11-24).
+# WMI_WOW_ENABLE flags 0x20 (system suspend) only and m52xq_hw_filter=3: values of the Phosh port, 2-4 minute sleeps, no WPSS crash.
+P=/sys/module/ath11k/parameters
+i=0
+while [ ! -w $P/m52xq_wow_flags ] && [ $i -lt 30 ]; do sleep 1; i=$((i + 1)); done
+[ -w $P/m52xq_wow_flags ] && echo 32 > $P/m52xq_wow_flags
+[ -w $P/m52xq_hw_filter ] && echo 3 > $P/m52xq_hw_filter
+grep -q s2idle /sys/power/mem_sleep && echo s2idle > /sys/power/mem_sleep
+
+arm() {	# pattern = the (EFS) address of the connection; WoWLAN belongs to the wiphy and is lost when WPSS restarts
+	mac=$(cat /sys/class/net/wlan0/address 2>/dev/null)
+	phy=$(basename "$(readlink -f /sys/class/net/wlan0/phy80211 2>/dev/null)" 2>/dev/null)
+	[ -n "$mac" ] && [ -n "$phy" ] || return 1
+	iw phy "$phy" wowlan show 2>/dev/null | grep -q "WoWLAN is enabled" && return 0
+	iw phy "$phy" wowlan enable disconnect magic-packet patterns "$mac" && echo "WoWLAN armed on $phy"
+}
+# a plain timer (does not wake the phone): the state is checked only while the phone is awake; WPSS restart or a new connection is caught here
+while :; do
+	arm
+	sleep 15
+done

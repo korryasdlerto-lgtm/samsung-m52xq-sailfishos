@@ -1,0 +1,107 @@
+M52XQ: qmimodem gprs: retry the LTE attach parameters while the attach is running
+
+Right after the registration the modem answers QMI error 118 (OperationInProgress). Ask again every 2 s (20 times). Also
+log the result of START NETWORK (without a call end reason it was silent).
+
+--- a/drivers/qmimodem/gprs.c
++++ b/drivers/qmimodem/gprs.c
+@@ -9,6 +9,8 @@
+ #include <config.h>
+ #endif
+ 
++#include <glib.h>
++
+ #include <ofono/log.h>
+ #include <ofono/modem.h>
+ #include <ofono/gprs.h>
+@@ -25,8 +27,41 @@
+ 	struct qmi_service *wds;
+ 	unsigned int default_profile;
+ 	bool lte_queried;
++	guint lte_retry_source;
++	int lte_retries;
+ };
+ 
++#define LTE_ATTACH_RETRY_SECONDS	2
++#define LTE_ATTACH_RETRY_MAX		20
++
++static void get_lte_attach_params(struct ofono_gprs *gprs);
++
++static gboolean lte_attach_retry(gpointer user_data)
++{
++	struct ofono_gprs *gprs = user_data;
++	struct gprs_data *data = ofono_gprs_get_data(gprs);
++
++	data->lte_retry_source = 0;
++	get_lte_attach_params(gprs);
++
++	return FALSE;
++}
++
++/* M52XQ: the attach is still running (QMI error 118): ask again later */
++static bool lte_attach_schedule_retry(struct ofono_gprs *gprs)
++{
++	struct gprs_data *data = ofono_gprs_get_data(gprs);
++
++	if (data->lte_retry_source ||
++			data->lte_retries >= LTE_ATTACH_RETRY_MAX)
++		return false;
++
++	data->lte_retries++;
++	data->lte_retry_source = g_timeout_add_seconds(LTE_ATTACH_RETRY_SECONDS,
++						lte_attach_retry, gprs);
++	return true;
++}
++
+ static bool extract_ss_info(struct qmi_result *result, int *status, int *tech)
+ {
+ 	const struct qmi_nas_serving_system *ss;
+@@ -65,6 +100,9 @@
+ 	DBG("");
+ 
+ 	if (qmi_result_set_error(result, &error)) {
++		if (lte_attach_schedule_retry(gprs))
++			return;
++
+ 		ofono_error("get_lte_attach_param_cb: %hd", error);
+ 		goto noapn;
+ 	}
+@@ -76,6 +114,9 @@
+ 		goto noapn;
+ 	}
+ 
++	ofono_info("LTE default bearer: APN %s, profile %u, %d retries", apn,
++				data->default_profile, data->lte_retries);
++	data->lte_retries = 0;
+ 	ofono_gprs_cid_activated(gprs, data->default_profile, apn);
+ 	l_free(apn);
+ 
+@@ -122,6 +163,7 @@
+ 			tech == ACCESS_TECHNOLOGY_EUTRAN) {
+ 		if (!data->lte_queried) {
+ 			data->lte_queried = true;
++			data->lte_retries = 0;
+ 			get_lte_attach_params(gprs);
+ 		}
+ 	} else
+@@ -480,6 +522,9 @@
+ 
+ 	ofono_gprs_set_data(gprs, NULL);
+ 
++	if (data->lte_retry_source)
++		g_source_remove(data->lte_retry_source);
++
+ 	qmi_service_free(data->wds);
+ 	qmi_service_free(data->nas);
+ 	l_free(data);
+--- a/drivers/qmimodem/gprs-context.c
++++ b/drivers/qmimodem/gprs-context.c
+@@ -289,6 +289,8 @@
+ 
+ 	DBG("family: %d, error: %u", family, error);
+ 
++	ofono_info("Start network (IPv%d): QMI result %u", family, error);
++
+ 	if (error) {
+ 		const uint8_t *verbose;
+ 		uint16_t reason, len;

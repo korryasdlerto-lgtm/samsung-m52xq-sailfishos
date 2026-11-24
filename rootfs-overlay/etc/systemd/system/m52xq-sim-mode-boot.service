@@ -1,0 +1,9 @@
+[Unit]
+Description=M52XQ: apply the saved SIM mode (both SIMs / only SIM 1 / only SIM 2)
+After=ofono.service m52xq-sim-dir.service
+Wants=ofono.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/m52xq-sim-mode apply
+[Install]
+WantedBy=multi-user.target

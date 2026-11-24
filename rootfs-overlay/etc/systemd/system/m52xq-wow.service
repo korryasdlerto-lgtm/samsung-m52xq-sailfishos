@@ -1,0 +1,12 @@
+[Unit]
+Description=M52XQ: Wi-Fi wake-up from sleep (WoW) and s2idle
+After=connman.service
+Wants=connman.service
+
+[Service]
+ExecStart=/usr/local/sbin/m52xq-wow
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

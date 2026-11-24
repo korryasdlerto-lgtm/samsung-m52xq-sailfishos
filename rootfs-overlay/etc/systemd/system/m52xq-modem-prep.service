@@ -1,0 +1,17 @@
+[Unit]
+Description=Modem preparation: UIM provisioning session and rmnet links, then ofono
+# The modem's UIM service and IPA can take about a minute, after a modem crash 90-100 s.
+# The script then keeps watching and prepares the modem again after every modem restart.
+# ofono is not started by network.target (network.target.wants/ofono.service is
+# masked in /etc): this unit starts it when the modem is prepared, so neither
+# network.target nor the user session (systemd-user-sessions orders after network.target)
+# waits for the modem.
+After=rmtfs.service tqftpserv.service
+Before=ofono.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/m52xq-modem-prep
+
+[Install]
+WantedBy=multi-user.target

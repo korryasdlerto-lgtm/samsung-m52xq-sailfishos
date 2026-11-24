@@ -1,0 +1,1 @@
+/dev/disk/by-partlabel/userdata /mnt/userdata ext4 noatime,nofail,x-systemd.device-timeout=10s 0 2

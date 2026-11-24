@@ -1,0 +1,8 @@
+[Unit]
+Description=M52XQ: watch for reboot menu requests
+After=m52xq-power-dir.service
+Requires=m52xq-power-dir.service
+[Path]
+PathChanged=/run/m52xq-power/request
+[Install]
+WantedBy=multi-user.target

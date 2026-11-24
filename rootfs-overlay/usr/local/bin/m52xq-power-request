@@ -1,0 +1,11 @@
+#!/bin/sh
+# m52xq (Sailfish): run the action that m52xq-reboot-menu wrote to /run/m52xq-power/request (root, m52xq-power-request.path).
+f=/run/m52xq-power/request
+[ -s "$f" ] || exit 0
+a=$(head -c 16 "$f" | tr -dc 'a-z'); rm -f "$f"
+case "$a" in
+reboot) exec systemctl reboot ;;
+recovery) exec systemctl reboot recovery ;;
+poweroff) exec systemctl poweroff ;;
+*) echo "unknown request '$a'"; exit 1 ;;
+esac

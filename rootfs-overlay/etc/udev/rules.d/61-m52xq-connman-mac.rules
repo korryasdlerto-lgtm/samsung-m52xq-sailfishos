@@ -1,0 +1,2 @@
+# m52xq: started after 60-m52xq-wifi-mac.rules has set the address (RUN is done before systemd sees the event)
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="m52xq-connman-mac.service"

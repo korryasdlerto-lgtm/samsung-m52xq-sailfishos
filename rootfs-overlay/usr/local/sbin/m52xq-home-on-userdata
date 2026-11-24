@@ -1,0 +1,38 @@
+#!/bin/sh
+# M52XQ: /home on the userdata partition (ext4, ~107 GB) instead of the small system image. /mnt/userdata comes from
+# /etc/fstab (nofail). On the first boot after a (re)flash /home is copied there (cp -a keeps owners / modes, through a
+# temp dir: a broken copy is never used), then /mnt/userdata/home is bind-mounted over /home. Without userdata the old
+# /home of the image stays (fallback). Sailfish: no user in the image yet (created at the first start), so the mark of a
+# finished copy is home/.system; a foreign home (of another port) is renamed, never deleted.
+set -u
+U=/mnt/userdata
+log() { echo "m52xq-home-on-userdata: $*"; }
+if ! mountpoint -q "$U"; then
+    log "$U is not mounted, /home stays on the system image"
+    exit 0
+fi
+if mountpoint -q /home; then
+    log "/home is a mount point already, nothing to do"
+    exit 0
+fi
+if [ ! -d "$U/home/.system" ]; then
+    log "first boot: copying /home to $U/home"
+    rm -rf "$U/home.m52xq-tmp"
+    if mkdir -p "$U/home.m52xq-tmp" && cp -a /home/. "$U/home.m52xq-tmp/"; then
+        if [ -e "$U/home" ]; then
+            n=1
+            while [ -e "$U/home.other-$n" ]; do n=$((n + 1)); done
+            mv "$U/home" "$U/home.other-$n" || { log "cannot rename the old home"; rm -rf "$U/home.m52xq-tmp"; exit 0; }
+            log "home of another system kept as $U/home.other-$n"
+        fi
+        mv "$U/home.m52xq-tmp" "$U/home"
+        chmod 755 "$U/home"
+        sync
+    else
+        log "copy failed, /home stays on the system image"
+        rm -rf "$U/home.m52xq-tmp"
+        exit 0
+    fi
+fi
+mount --bind "$U/home" /home && log "/home -> $U/home" || log "bind mount failed, /home stays on the system image"
+exit 0

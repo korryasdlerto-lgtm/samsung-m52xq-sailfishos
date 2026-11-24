@@ -1,0 +1,4 @@
+# m52xq (from sailfishos-pro1x-mainline): sandboxed apps with the Camera permission need the software ISP tuning files of libcamera,
+# without them the debayering is off (no picture). Camera.permission has no per-device hook, every sandbox includes
+# disable-common.inc; the directory is read-only data.
+whitelist /usr/share/libcamera

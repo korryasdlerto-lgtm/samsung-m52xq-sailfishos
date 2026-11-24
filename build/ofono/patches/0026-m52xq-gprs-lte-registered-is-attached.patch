@@ -1,0 +1,26 @@
+M52XQ: gprs: on LTE, packet service registered counts as attached
+
+connman deactivates the default bearer while Wi-Fi is in use. ofono then dropped Attached on LTE (no active context), the
+cellular service disappeared and Connect failed.
+
+--- a/src/gprs.c
++++ b/src/gprs.c
+@@ -1625,7 +1625,17 @@
+ 		 * expect the gprs status to be unknown. That must not
+ 		 * result in detaching...
+ 		 */
+-		attached = have_active_contexts(gprs);
++		/*
++		 * M52XQ: that is not enough: connman deactivates the default
++		 * bearer while Wi-Fi is in use, Attached went false, the
++		 * cellular service vanished and could not be connected again
++		 * ("not attached"). Packet service registered = attached.
++		 */
++		attached = have_active_contexts(gprs) || L_IN_SET(status,
++			NETWORK_REGISTRATION_STATUS_REGISTERED,
++			NETWORK_REGISTRATION_STATUS_REGISTERED_SMS_EUTRAN,
++			NETWORK_REGISTRATION_STATUS_ROAMING,
++			NETWORK_REGISTRATION_STATUS_ROAMING_SMS_EUTRAN);
+ 	else
+ 		attached = gprs->driver_attached && L_IN_SET(status,
+ 			NETWORK_REGISTRATION_STATUS_REGISTERED,
